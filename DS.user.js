@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      2.3
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close the post-submit tab for manual submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
@@ -95,49 +95,54 @@
     const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
 
     // ---------------------------------------------------------
-    // PHASE 0: Any non-queue worker.mturk.com page - if a
+    // PHASE 0: Any non-queue worker.mturk.com page - when a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // redirect to /tasks ONLY IF our script just auto-submitted an
-    // NYT HIT (AUTO_SUBMIT_FLAG_KEY in sessionStorage is fresh).
-    // Manual submits of other requesters' HITs are left alone.
+    // act on the post-submit tab:
+    //   * AUTO_SUBMIT_FLAG_KEY fresh -> redirect to /tasks
+    //     (keeps the queue tab alive so it can pick up the next HIT)
+    //   * otherwise -> close the tab instantly
+    //     (post-submit landing page for any manual submit)
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
-        const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
-        const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
+        const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
+        let done = false;
 
-        if (autoSubmitFresh) {
-            sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
-
-            const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
-            let redirected = false;
-
-            const checkForSubmitBanner = () => {
-                if (redirected || !document.body) return false;
-                const text = document.body.textContent || '';
-                for (const marker of SUBMIT_MARKERS) {
-                    if (text.includes(marker)) {
-                        redirected = true;
+        const checkForSubmitBanner = () => {
+            if (done || !document.body) return false;
+            const text = document.body.textContent || '';
+            for (const marker of SUBMIT_MARKERS) {
+                if (text.includes(marker)) {
+                    done = true;
+                    const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
+                    const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
+                    if (autoSubmitFresh) {
+                        sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
                         window.location.href = QUEUE_URL;
-                        return true;
+                    } else {
+                        closeThisTabNow();
                     }
+                    return true;
                 }
-                return false;
-            };
+            }
+            return false;
+        };
 
-            const startSubmitWatcher = () => {
-                if (!document.body) {
-                    setTimeout(startSubmitWatcher, 50);
-                    return;
-                }
-                if (checkForSubmitBanner()) return;
-                const obs = new MutationObserver(() => {
-                    if (checkForSubmitBanner()) obs.disconnect();
-                });
-                obs.observe(document.body, { childList: true, subtree: true });
-                setTimeout(() => obs.disconnect(), 15000);
-            };
-            startSubmitWatcher();
-        }
+        const startSubmitWatcher = () => {
+            if (!document.body) {
+                setTimeout(startSubmitWatcher, 50);
+                return;
+            }
+            if (checkForSubmitBanner()) return;
+            const obs = new MutationObserver(() => {
+                if (checkForSubmitBanner()) obs.disconnect();
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            // Stop watching after 15 s - if no banner by then, the
+            // worker just navigated here normally (browse, dashboard,
+            // etc.), so leave the page alone.
+            setTimeout(() => obs.disconnect(), 15000);
+        };
+        startSubmitWatcher();
     }
 
     // ---------------------------------------------------------
