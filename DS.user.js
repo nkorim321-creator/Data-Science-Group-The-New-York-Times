@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, auto-close manually-opened HIT tabs after submit (PCM/middle-click), auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      2.2
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
 // @match        https://*.s3.amazonaws.com/*
-// @grant        none
+// @grant        GM_closeBrowserTab
 // @updateURL    https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // @downloadURL  https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // ==/UserScript==
@@ -25,15 +25,20 @@
     const AUTO_SUBMIT_FLAG_KEY = '__nyt_auto_submit_flag__';
     const AUTO_SUBMIT_FLAG_TTL_MS = 15000;
     const AUTO_SUBMIT_MESSAGE_TYPE = '__nyt_auto_submit__';
-    // Flag Phase 1 writes to sessionStorage just before clicking a Work
-    // button. Phase 2 reads it on the HIT page to know whether the HIT
-    // was opened by our auto-flow (same tab navigating from /tasks) or
-    // by the worker manually opening a HIT in a new tab. Manually-opened
-    // tabs get marked with MANUAL_TAB_FLAG_KEY so Phase 0 can close them
-    // after submit.
-    const AUTO_OPENED_FLAG_KEY = '__nyt_auto_opened_at__';
-    const AUTO_OPENED_TTL_MS = 30000;
-    const MANUAL_TAB_FLAG_KEY = '__nyt_manual_tab__';
+
+    // Close the current tab instantly, no warning page, no delay.
+    // GM_closeBrowserTab (Tampermonkey/Violentmonkey) can close any
+    // tab; window.close() is a fallback for tabs the userscript
+    // engine considers script-opened.
+    const closeThisTabNow = () => {
+        try {
+            if (typeof GM_closeBrowserTab === 'function') {
+                GM_closeBrowserTab();
+                return;
+            }
+        } catch (e) {}
+        try { window.close(); } catch (e) {}
+    };
 
     // ---------------------------------------------------------
     // Bangladesh Standard Time (BST = UTC+6) reload windows.
@@ -90,45 +95,29 @@
     const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
 
     // ---------------------------------------------------------
-    // PHASE 0: Any non-queue worker.mturk.com page - when a
+    // PHASE 0: Any non-queue worker.mturk.com page - if a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // act based on which tab this is:
-    //   * AUTO_SUBMIT_FLAG_KEY fresh (our auto-submit) -> redirect to /tasks
-    //   * MANUAL_TAB_FLAG_KEY set (worker manually opened this tab
-    //     and just submitted) -> close the tab
-    //   * neither (other requester's manual submit in the queue tab) ->
-    //     do nothing, so the always-open queue tab isn't disturbed
+    // redirect to /tasks ONLY IF our script just auto-submitted an
+    // NYT HIT (AUTO_SUBMIT_FLAG_KEY in sessionStorage is fresh).
+    // Manual submits of other requesters' HITs are left alone.
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
         const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
         const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
-        const isManualTab = sessionStorage.getItem(MANUAL_TAB_FLAG_KEY) === '1';
 
-        const action = autoSubmitFresh ? 'redirect' : (isManualTab ? 'close' : null);
-
-        if (action) {
+        if (autoSubmitFresh) {
             sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
-            sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
 
             const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
-            let done = false;
+            let redirected = false;
 
             const checkForSubmitBanner = () => {
-                if (done || !document.body) return false;
+                if (redirected || !document.body) return false;
                 const text = document.body.textContent || '';
                 for (const marker of SUBMIT_MARKERS) {
                     if (text.includes(marker)) {
-                        done = true;
-                        if (action === 'redirect') {
-                            window.location.href = QUEUE_URL;
-                        } else {
-                            // window.close() only works on script-opened
-                            // tabs (PCM, window.open, etc.). For tabs
-                            // browsers block from closing, the tab stays
-                            // on the post-submit page; the worker can
-                            // close it manually.
-                            try { window.close(); } catch (e) {}
-                        }
+                        redirected = true;
+                        window.location.href = QUEUE_URL;
                         return true;
                     }
                 }
@@ -145,7 +134,6 @@
                     if (checkForSubmitBanner()) obs.disconnect();
                 });
                 obs.observe(document.body, { childList: true, subtree: true });
-                // Stop watching after 15s - if no banner by then, give up
                 setTimeout(() => obs.disconnect(), 15000);
             };
             startSubmitWatcher();
@@ -157,11 +145,55 @@
     // ---------------------------------------------------------
     if (isQueuePage) {
 
-        // Clear any stale per-tab flags from a previous HIT in this tab
-        try {
-            sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
-            sessionStorage.removeItem(AUTO_OPENED_FLAG_KEY);
-        } catch (e) {}
+        // ---------------------------------------------------------
+        // Single-instance: if another /tasks tab is already open,
+        // close THIS one instantly. The first tab to load claims
+        // a localStorage slot and refreshes it every 1.5 s; any
+        // /tasks tab that loads later and sees a fresh claim from
+        // a different tabId closes itself with no warning page.
+        // ---------------------------------------------------------
+        const PRIMARY_KEY = '__nyt_tasks_primary__';
+        const STALE_MS = 5000;
+        const HEARTBEAT_MS = 1500;
+        const myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+
+        const readPrimary = () => {
+            try {
+                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
+                if (data && Date.now() - data.heartbeat < STALE_MS) return data;
+            } catch (e) {}
+            return null;
+        };
+        const writePrimary = () => {
+            try {
+                localStorage.setItem(PRIMARY_KEY, JSON.stringify({
+                    tabId: myTabId, heartbeat: Date.now()
+                }));
+            } catch (e) {}
+        };
+
+        const existing = readPrimary();
+        if (existing && existing.tabId !== myTabId) {
+            closeThisTabNow();
+            return;
+        }
+
+        writePrimary();
+        setInterval(() => {
+            const current = readPrimary();
+            if (current && current.tabId !== myTabId) {
+                closeThisTabNow();
+                return;
+            }
+            writePrimary();
+        }, HEARTBEAT_MS);
+
+        window.addEventListener('beforeunload', () => {
+            try {
+                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
+                if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
+            } catch (e) {}
+        });
 
         let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
@@ -187,9 +219,6 @@
 
                 if (workButton) {
                     workClicked = true;
-                    try {
-                        sessionStorage.setItem(AUTO_OPENED_FLAG_KEY, Date.now().toString());
-                    } catch (e) {}
                     workButton.click();
                     return true;
                 }
@@ -289,11 +318,6 @@
         // Top window of the HIT page: receive the iframe's signal and
         // record the flag in worker.mturk.com's sessionStorage so it
         // survives the navigation MTurk does after the form submits.
-        // Also detect whether this tab was opened by our auto-flow
-        // (Phase 1 clicked Work, same tab navigated) vs. opened manually
-        // by the worker (new tab from PCM / middle-click / "Open in new
-        // tab"). Manually-opened tabs are marked so Phase 0 can close
-        // them after submit.
         if (!isMturkIframe) {
             window.addEventListener('message', (event) => {
                 if (event && event.data && event.data.type === AUTO_SUBMIT_MESSAGE_TYPE) {
@@ -302,19 +326,6 @@
                     } catch (e) {}
                 }
             });
-
-            try {
-                sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
-                const autoOpenedAt = parseInt(sessionStorage.getItem(AUTO_OPENED_FLAG_KEY) || '0', 10);
-                const wasAutoOpened = autoOpenedAt && (Date.now() - autoOpenedAt < AUTO_OPENED_TTL_MS);
-                if (wasAutoOpened) {
-                    sessionStorage.removeItem(AUTO_OPENED_FLAG_KEY);
-                } else if (window.history && window.history.length <= 1) {
-                    // Fresh tab with this HIT as its only entry - the
-                    // worker opened it manually (PCM, middle-click, etc.)
-                    sessionStorage.setItem(MANUAL_TAB_FLAG_KEY, '1');
-                }
-            } catch (e) {}
         }
 
         let hasSubmitted = false;
