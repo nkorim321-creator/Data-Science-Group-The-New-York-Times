@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks ONLY for our auto-submits (manual submits of other requesters' HITs are left alone), auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      2.1
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, auto-close manually-opened HIT tabs after submit (PCM/middle-click), auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
@@ -25,6 +25,15 @@
     const AUTO_SUBMIT_FLAG_KEY = '__nyt_auto_submit_flag__';
     const AUTO_SUBMIT_FLAG_TTL_MS = 15000;
     const AUTO_SUBMIT_MESSAGE_TYPE = '__nyt_auto_submit__';
+    // Flag Phase 1 writes to sessionStorage just before clicking a Work
+    // button. Phase 2 reads it on the HIT page to know whether the HIT
+    // was opened by our auto-flow (same tab navigating from /tasks) or
+    // by the worker manually opening a HIT in a new tab. Manually-opened
+    // tabs get marked with MANUAL_TAB_FLAG_KEY so Phase 0 can close them
+    // after submit.
+    const AUTO_OPENED_FLAG_KEY = '__nyt_auto_opened_at__';
+    const AUTO_OPENED_TTL_MS = 30000;
+    const MANUAL_TAB_FLAG_KEY = '__nyt_manual_tab__';
 
     // ---------------------------------------------------------
     // Bangladesh Standard Time (BST = UTC+6) reload windows.
@@ -81,30 +90,45 @@
     const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
 
     // ---------------------------------------------------------
-    // PHASE 0: Any non-queue worker.mturk.com page - if a
+    // PHASE 0: Any non-queue worker.mturk.com page - when a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // redirect to /tasks ONLY IF our script just auto-submitted an
-    // NYT HIT (i.e. AUTO_SUBMIT_FLAG_KEY in sessionStorage is fresh).
-    // Manual submits of other requesters' HITs leave the worker on
-    // MTurk's post-submit page so they don't get a duplicate /tasks tab.
+    // act based on which tab this is:
+    //   * AUTO_SUBMIT_FLAG_KEY fresh (our auto-submit) -> redirect to /tasks
+    //   * MANUAL_TAB_FLAG_KEY set (worker manually opened this tab
+    //     and just submitted) -> close the tab
+    //   * neither (other requester's manual submit in the queue tab) ->
+    //     do nothing, so the always-open queue tab isn't disturbed
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
         const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
         const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
+        const isManualTab = sessionStorage.getItem(MANUAL_TAB_FLAG_KEY) === '1';
 
-        if (autoSubmitFresh) {
+        const action = autoSubmitFresh ? 'redirect' : (isManualTab ? 'close' : null);
+
+        if (action) {
             sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
+            sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
 
             const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
-            let redirected = false;
+            let done = false;
 
             const checkForSubmitBanner = () => {
-                if (redirected || !document.body) return false;
+                if (done || !document.body) return false;
                 const text = document.body.textContent || '';
                 for (const marker of SUBMIT_MARKERS) {
                     if (text.includes(marker)) {
-                        redirected = true;
-                        window.location.href = QUEUE_URL;
+                        done = true;
+                        if (action === 'redirect') {
+                            window.location.href = QUEUE_URL;
+                        } else {
+                            // window.close() only works on script-opened
+                            // tabs (PCM, window.open, etc.). For tabs
+                            // browsers block from closing, the tab stays
+                            // on the post-submit page; the worker can
+                            // close it manually.
+                            try { window.close(); } catch (e) {}
+                        }
                         return true;
                     }
                 }
@@ -133,6 +157,12 @@
     // ---------------------------------------------------------
     if (isQueuePage) {
 
+        // Clear any stale per-tab flags from a previous HIT in this tab
+        try {
+            sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
+            sessionStorage.removeItem(AUTO_OPENED_FLAG_KEY);
+        } catch (e) {}
+
         let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
         const RELOAD_INTERVAL_MS = 60 * 1000;
@@ -157,6 +187,9 @@
 
                 if (workButton) {
                     workClicked = true;
+                    try {
+                        sessionStorage.setItem(AUTO_OPENED_FLAG_KEY, Date.now().toString());
+                    } catch (e) {}
                     workButton.click();
                     return true;
                 }
@@ -256,6 +289,11 @@
         // Top window of the HIT page: receive the iframe's signal and
         // record the flag in worker.mturk.com's sessionStorage so it
         // survives the navigation MTurk does after the form submits.
+        // Also detect whether this tab was opened by our auto-flow
+        // (Phase 1 clicked Work, same tab navigated) vs. opened manually
+        // by the worker (new tab from PCM / middle-click / "Open in new
+        // tab"). Manually-opened tabs are marked so Phase 0 can close
+        // them after submit.
         if (!isMturkIframe) {
             window.addEventListener('message', (event) => {
                 if (event && event.data && event.data.type === AUTO_SUBMIT_MESSAGE_TYPE) {
@@ -264,6 +302,19 @@
                     } catch (e) {}
                 }
             });
+
+            try {
+                sessionStorage.removeItem(MANUAL_TAB_FLAG_KEY);
+                const autoOpenedAt = parseInt(sessionStorage.getItem(AUTO_OPENED_FLAG_KEY) || '0', 10);
+                const wasAutoOpened = autoOpenedAt && (Date.now() - autoOpenedAt < AUTO_OPENED_TTL_MS);
+                if (wasAutoOpened) {
+                    sessionStorage.removeItem(AUTO_OPENED_FLAG_KEY);
+                } else if (window.history && window.history.length <= 1) {
+                    // Fresh tab with this HIT as its only entry - the
+                    // worker opened it manually (PCM, middle-click, etc.)
+                    sessionStorage.setItem(MANUAL_TAB_FLAG_KEY, '1');
+                }
+            } catch (e) {}
         }
 
         let hasSubmitted = false;
