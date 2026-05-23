@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, fast return to queue, auto-work on 2nd HIT from same requester.
+// @version      1.6
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, fast return to queue, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/tasks*
 // @match        https://worker.mturk.com/projects/*/tasks/*
@@ -115,6 +115,47 @@
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) reloadTick();
         });
+
+        // ---------------------------------------------------------
+        // Blank-page recovery: MTurk sometimes renders /tasks as a
+        // completely blank white page on certain Worker IDs. After
+        // BLANK_CHECK_DELAY_MS we look for any expected queue content;
+        // if missing, reload. Attempts capped to avoid infinite loops.
+        // ---------------------------------------------------------
+        const BLANK_CHECK_DELAY_MS = 6000;
+        const MAX_BLANK_RELOADS = 5;
+        const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
+
+        const recoverFromBlank = () => {
+            if (workClicked) return;
+
+            const text = document.body ? document.body.textContent : '';
+            const looksLoaded =
+                text.includes('HITs Queue') ||
+                text.includes('Your HITs') ||
+                text.includes('Requester') ||
+                text.includes('Browse all available HITs') ||
+                document.querySelector('header, .navbar, .table, table, .task-row, [class*="HitSet"]');
+
+            if (looksLoaded) {
+                sessionStorage.removeItem(BLANK_RELOAD_KEY);
+                return;
+            }
+
+            const count = parseInt(sessionStorage.getItem(BLANK_RELOAD_KEY) || '0', 10);
+            if (count >= MAX_BLANK_RELOADS) return;
+
+            sessionStorage.setItem(BLANK_RELOAD_KEY, (count + 1).toString());
+
+            if (count < 2) {
+                window.location.reload();
+            } else {
+                // After repeated failures, cache-bust the URL to force a fresh fetch
+                window.location.href = QUEUE_URL + '?_t=' + Date.now();
+            }
+        };
+
+        setTimeout(recoverFromBlank, BLANK_CHECK_DELAY_MS);
     }
 
     // ---------------------------------------------------------
