@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      1.8
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      1.9
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery, single-instance /tasks tab.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
@@ -118,12 +118,81 @@
     // ---------------------------------------------------------
     if (isQueuePage) {
 
+        // ---------------------------------------------------------
+        // Single-instance enforcement: only one /tasks tab allowed.
+        // First tab claims a localStorage "primary" slot and writes
+        // a heartbeat every 1.5s. Any /tasks tab that loads later
+        // and sees a fresh heartbeat closes itself. If window.close()
+        // is blocked (tab wasn't script-opened), fall back to
+        // navigating to about:blank so the slot stays free.
+        // ---------------------------------------------------------
+        const TAB_KEY = '__nyt_userscript_tasks_primary__';
+        const HEARTBEAT_INTERVAL_MS = 1500;
+        const STALE_HEARTBEAT_MS = 5000;
+        const myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+
+        let amDuplicate = false;
+
+        const readPrimary = () => {
+            try {
+                const raw = localStorage.getItem(TAB_KEY);
+                if (!raw) return null;
+                const data = JSON.parse(raw);
+                if (Date.now() - data.heartbeat > STALE_HEARTBEAT_MS) return null;
+                return data;
+            } catch (e) { return null; }
+        };
+
+        const writePrimary = () => {
+            try {
+                localStorage.setItem(TAB_KEY, JSON.stringify({
+                    tabId: myTabId,
+                    heartbeat: Date.now()
+                }));
+            } catch (e) {}
+        };
+
+        const closeAsDuplicate = () => {
+            if (amDuplicate) return;
+            amDuplicate = true;
+            try { window.close(); } catch (e) {}
+            setTimeout(() => {
+                try { window.location.replace('about:blank'); } catch (e) {}
+            }, 150);
+        };
+
+        const existingPrimary = readPrimary();
+        if (existingPrimary && existingPrimary.tabId !== myTabId) {
+            closeAsDuplicate();
+        } else {
+            writePrimary();
+            setInterval(() => {
+                if (amDuplicate) return;
+                const current = readPrimary();
+                if (current && current.tabId !== myTabId) {
+                    // Another tab took the primary slot - we close
+                    closeAsDuplicate();
+                    return;
+                }
+                writePrimary();
+            }, HEARTBEAT_INTERVAL_MS);
+
+            window.addEventListener('beforeunload', () => {
+                try {
+                    const data = JSON.parse(localStorage.getItem(TAB_KEY) || 'null');
+                    if (data && data.tabId === myTabId) {
+                        localStorage.removeItem(TAB_KEY);
+                    }
+                } catch (e) {}
+            });
+        }
+
         let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
         const RELOAD_INTERVAL_MS = 60 * 1000;
 
         const scanQueueForRequester = () => {
-            if (workClicked) return true;
+            if (amDuplicate || workClicked) return true;
 
             const rows = document.querySelectorAll(
                 '.project-detail-bar, .table-row, tr, li.task-row, ' +
@@ -167,7 +236,7 @@
         // Reload only when (a) inside a BST window AND (b) 60s elapsed since load
         // AND (c) we haven't clicked a HIT yet. Outside windows = page stays idle.
         const reloadTick = () => {
-            if (workClicked) return;
+            if (amDuplicate || workClicked) return;
             if (!isInReloadWindow()) return;
             if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
             window.location.reload();
@@ -191,7 +260,7 @@
         const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
 
         const recoverFromBlank = () => {
-            if (workClicked) return;
+            if (amDuplicate || workClicked) return;
 
             const text = document.body ? document.body.textContent : '';
             const looksLoaded =
