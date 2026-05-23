@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, fast return to queue, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      1.7
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
-// @match        https://worker.mturk.com/tasks*
-// @match        https://worker.mturk.com/projects/*/tasks/*
+// @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
 // @match        https://*.s3.amazonaws.com/*
 // @grant        none
@@ -25,14 +24,14 @@
     // Page reloads every 60s ONLY when current BST time is inside
     // one of these 20-minute windows. Outside windows = idle.
     //   02:00 - 02:20 AM
-    //   04:00 - 04:20 AM
+    //   04:00 - 04:20 PM  (16:00 - 16:20)
     //   06:00 - 06:20 AM
     //   11:00 - 11:20 AM
     //   09:00 - 09:20 PM  (21:00 - 21:20)
     // ---------------------------------------------------------
     const RELOAD_WINDOWS = [
         [ 2 * 60,  2 * 60 + 20],
-        [ 4 * 60,  4 * 60 + 20],
+        [16 * 60, 16 * 60 + 20],
         [ 6 * 60,  6 * 60 + 20],
         [11 * 60, 11 * 60 + 20],
         [21 * 60, 21 * 60 + 20]
@@ -50,9 +49,74 @@
     };
 
     // ---------------------------------------------------------
+    // URL dispatch: identify which kind of page we're on.
+    //   Queue page:        worker.mturk.com/tasks
+    //   HIT shell/iframe:  worker.mturk.com/projects/<id>/tasks/<id>
+    //                      *.mturkcontent.com / *.s3.amazonaws.com
+    //   Other mturk page:  worker.mturk.com/* (root, /projects listing,
+    //                      /dashboard, etc.) - used for post-submit redirect
+    // ---------------------------------------------------------
+    let hostname = '';
+    let pathname = '';
+    try {
+        const u = new URL(currentUrl);
+        hostname = u.hostname;
+        pathname = u.pathname;
+    } catch (e) {
+        // fallback
+    }
+
+    const isMturkIframe = /mturkcontent\.com$/.test(hostname) || /\.s3\.amazonaws\.com$/.test(hostname);
+    const isWorkerMturk = hostname === 'worker.mturk.com';
+    const isQueuePage = isWorkerMturk && pathname === '/tasks';
+    const isHitPage = isMturkIframe ||
+                      (isWorkerMturk && /^\/projects\/[^/]+\/tasks\//.test(pathname));
+    const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
+
+    // ---------------------------------------------------------
+    // PHASE 0: Any non-queue worker.mturk.com page - if a
+    // "HIT Submitted" / "successfully submitted" banner appears,
+    // immediately redirect to /tasks. This catches the case where
+    // MTurk redirects to /projects (HIT Groups) or / after submit
+    // before our in-iframe redirect can fire.
+    // ---------------------------------------------------------
+    if (isOtherMturkPage) {
+        const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
+        let redirected = false;
+
+        const checkForSubmitBanner = () => {
+            if (redirected || !document.body) return false;
+            const text = document.body.textContent || '';
+            for (const marker of SUBMIT_MARKERS) {
+                if (text.includes(marker)) {
+                    redirected = true;
+                    window.location.href = QUEUE_URL;
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        const startSubmitWatcher = () => {
+            if (!document.body) {
+                setTimeout(startSubmitWatcher, 50);
+                return;
+            }
+            if (checkForSubmitBanner()) return;
+            const obs = new MutationObserver(() => {
+                if (checkForSubmitBanner()) obs.disconnect();
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            // Stop watching after 15s - if no banner by then, user navigated here manually
+            setTimeout(() => obs.disconnect(), 15000);
+        };
+        startSubmitWatcher();
+    }
+
+    // ---------------------------------------------------------
     // PHASE 1: Queue page - scan for requester + time-windowed reload
     // ---------------------------------------------------------
-    if (currentUrl.includes('worker.mturk.com/tasks') && !currentUrl.includes('/projects/')) {
+    if (isQueuePage) {
 
         let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
@@ -160,10 +224,11 @@
 
     // ---------------------------------------------------------
     // PHASE 2: HIT page - auto-select checkbox, submit, redirect to queue
-    // After submit -> /tasks. Phase 1 will auto-click 2nd HIT from same
-    // requester if one is queued; otherwise the page stays idle.
+    // After submit we try in-iframe redirect (fast path); if MTurk wins
+    // the race and lands on /projects or root, Phase 0 catches the
+    // "HIT Submitted" banner and redirects to /tasks.
     // ---------------------------------------------------------
-    else {
+    else if (isHitPage) {
         let hasSubmitted = false;
 
         const processTaskContent = () => {
