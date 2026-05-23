@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -22,19 +22,19 @@
     // ---------------------------------------------------------
     // Bangladesh Standard Time (BST = UTC+6) reload windows.
     // Page reloads every 60s ONLY when current BST time is inside
-    // one of these 20-minute windows. Outside windows = idle.
-    //   02:00 - 02:20 AM
-    //   04:00 - 04:20 PM  (16:00 - 16:20)
-    //   06:00 - 06:20 AM
-    //   11:00 - 11:20 AM
-    //   09:00 - 09:20 PM  (21:00 - 21:20)
+    // one of these 30-minute windows. Outside windows = idle.
+    //   02:00 - 02:30 AM
+    //   04:00 - 04:30 PM  (16:00 - 16:30)
+    //   06:00 - 06:30 AM
+    //   11:00 - 11:30 AM
+    //   09:00 - 09:30 PM  (21:00 - 21:30)
     // ---------------------------------------------------------
     const RELOAD_WINDOWS = [
-        [ 2 * 60,  2 * 60 + 20],
-        [16 * 60, 16 * 60 + 20],
-        [ 6 * 60,  6 * 60 + 20],
-        [11 * 60, 11 * 60 + 20],
-        [21 * 60, 21 * 60 + 20]
+        [ 2 * 60,  2 * 60 + 30],
+        [16 * 60, 16 * 60 + 30],
+        [ 6 * 60,  6 * 60 + 30],
+        [11 * 60, 11 * 60 + 30],
+        [21 * 60, 21 * 60 + 30]
     ];
 
     const getBSTMinutesOfDay = () => {
