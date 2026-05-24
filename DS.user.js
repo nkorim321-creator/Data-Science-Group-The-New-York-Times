@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.6
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close the post-submit tab for manual submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      2.7
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
 // @match        https://*.s3.amazonaws.com/*
 // @grant        GM_closeBrowserTab
+// @grant        GM_openInTab
 // @updateURL    https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // @downloadURL  https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // ==/UserScript==
@@ -18,13 +19,21 @@
     const TARGET_REQUESTER = "Data Science Group, The New York Times";
     const QUEUE_URL = "https://worker.mturk.com/tasks";
     const currentUrl = window.location.href;
-    // Marker our script writes (via postMessage from iframe -> top window) just
-    // before auto-submitting an NYT HIT. Phase 0 only redirects to /tasks when
-    // this marker is fresh, so manual submits of other requesters' HITs do not
-    // get hijacked.
-    const AUTO_SUBMIT_FLAG_KEY = '__nyt_auto_submit_flag__';
-    const AUTO_SUBMIT_FLAG_TTL_MS = 15000;
-    const AUTO_SUBMIT_MESSAGE_TYPE = '__nyt_auto_submit__';
+
+    // Open a URL in a new background tab. Uses GM_openInTab when
+    // available (Tampermonkey/Violentmonkey - bypasses popup blocker
+    // even when not triggered by a user gesture, which matters because
+    // we open from a MutationObserver callback). Falls back to
+    // window.open.
+    const openTabInBackground = (url) => {
+        try {
+            if (typeof GM_openInTab === 'function') {
+                GM_openInTab(url, { active: false, insert: true, setParent: true });
+                return;
+            }
+        } catch (e) {}
+        try { window.open(url, '_blank'); } catch (e) {}
+    };
 
     // Close the current tab instantly, no warning page, no delay.
     // Tries multiple methods in order; whichever the userscript
@@ -116,11 +125,11 @@
     // ---------------------------------------------------------
     // PHASE 0: Any non-queue worker.mturk.com page - when a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // act on the post-submit tab:
-    //   * AUTO_SUBMIT_FLAG_KEY fresh -> redirect to /tasks
-    //     (keeps the queue tab alive so it can pick up the next HIT)
-    //   * otherwise -> close the tab instantly
-    //     (post-submit landing page for any manual submit)
+    // close this tab instantly. The always-open queue tab stays
+    // on /tasks and never reaches this code path; only HIT tabs
+    // (auto-opened by Phase 1 OR opened manually via PCM /
+    // middle-click) end up here, and the worker wants both kinds
+    // closed after submit.
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
         const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
@@ -132,14 +141,7 @@
             for (const marker of SUBMIT_MARKERS) {
                 if (text.includes(marker)) {
                     done = true;
-                    const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
-                    const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
-                    if (autoSubmitFresh) {
-                        sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
-                        window.location.href = QUEUE_URL;
-                    } else {
-                        closeThisTabNow();
-                    }
+                    closeThisTabNow();
                     return true;
                 }
             }
@@ -237,13 +239,15 @@
             } catch (e) {}
         });
 
-        let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
         const RELOAD_INTERVAL_MS = 60 * 1000;
+        // Track HIT URLs we've already opened during this page session so
+        // we don't keep re-opening the same one as the queue re-scans.
+        // Resets on every page reload, which is fine because by then any
+        // accepted HIT is no longer in the queue.
+        const openedHits = new Set();
 
         const scanQueueForRequester = () => {
-            if (workClicked) return true;
-
             const rows = document.querySelectorAll(
                 '.project-detail-bar, .table-row, tr, li.task-row, ' +
                 'div[class*="task-row"], div[class*="project-detail"]'
@@ -255,22 +259,31 @@
                 const workButton = row.querySelector(
                     'a[href*="/projects/"][href*="/tasks/accept"], ' +
                     'a.btn[href*="/projects/"], ' +
-                    'a[class*="work"][href*="/projects/"], ' +
-                    'button[class*="work"]'
+                    'a[class*="work"][href*="/projects/"]'
                 );
 
-                if (workButton) {
-                    workClicked = true;
-                    workButton.click();
-                    return true;
+                if (!workButton) continue;
+
+                const rawHref = workButton.getAttribute('href') || workButton.href;
+                if (!rawHref) continue;
+                let absoluteUrl;
+                try {
+                    absoluteUrl = new URL(rawHref, window.location.origin).href;
+                } catch (e) {
+                    continue;
                 }
+                if (openedHits.has(absoluteUrl)) continue;
+
+                openedHits.add(absoluteUrl);
+                openTabInBackground(absoluteUrl);
             }
-            return false;
         };
 
-        const queueObserver = new MutationObserver(() => {
-            if (scanQueueForRequester()) queueObserver.disconnect();
-        });
+        // Observer keeps running for the lifetime of this /tasks page -
+        // every time the queue updates we re-scan and open any new NYT
+        // HITs in fresh background tabs. The queue tab itself never
+        // navigates away.
+        const queueObserver = new MutationObserver(scanQueueForRequester);
 
         const startScanning = () => {
             if (!document.body) {
@@ -282,11 +295,10 @@
         };
         startScanning();
 
-        // Reload loop: ticks every 1s.
-        // Reload only when (a) inside a BST window AND (b) 60s elapsed since load
-        // AND (c) we haven't clicked a HIT yet. Outside windows = page stays idle.
+        // Reload loop: ticks every 1 s. Reload only when (a) inside a
+        // BST window AND (b) 60 s elapsed since load. Outside windows
+        // the queue tab stays idle.
         const reloadTick = () => {
-            if (workClicked) return;
             if (!isInReloadWindow()) return;
             if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
             window.location.reload();
@@ -326,8 +338,6 @@
         };
 
         const recoverFromBlank = () => {
-            if (workClicked) return;
-
             if (pageLooksLoaded()) {
                 sessionStorage.removeItem(BLANK_RELOAD_KEY);
                 return;
@@ -353,33 +363,16 @@
     }
 
     // ---------------------------------------------------------
-    // PHASE 2: HIT page - auto-select checkbox, submit, redirect to queue
+    // PHASE 2: HIT page - auto-select checkbox, submit. After the
+    // submit, MTurk navigates the top window to /projects (or /)
+    // with a "HIT Submitted" banner, where Phase 0 closes the tab.
     //
-    // The script runs in BOTH the worker.mturk.com top window AND the
-    // cross-origin mturkcontent.com / s3.amazonaws.com iframe. The NYT
-    // HIT content is in the iframe, so the auto-submit happens there.
-    //
-    // Just before auto-submitting, the iframe postMessages the top
-    // window so the top window can write AUTO_SUBMIT_FLAG_KEY into
-    // worker.mturk.com's sessionStorage. That flag is what Phase 0
-    // uses to distinguish our auto-submits from the worker's own
-    // manual submits of other requesters' HITs (which must NOT be
-    // redirected to /tasks, or they'd duplicate the always-open queue).
+    // The script runs in BOTH the worker.mturk.com top window AND
+    // the cross-origin mturkcontent.com / s3.amazonaws.com iframe.
+    // The NYT HIT content is in the iframe, so the auto-submit
+    // happens there.
     // ---------------------------------------------------------
     else if (isHitPage) {
-
-        // Top window of the HIT page: receive the iframe's signal and
-        // record the flag in worker.mturk.com's sessionStorage so it
-        // survives the navigation MTurk does after the form submits.
-        if (!isMturkIframe) {
-            window.addEventListener('message', (event) => {
-                if (event && event.data && event.data.type === AUTO_SUBMIT_MESSAGE_TYPE) {
-                    try {
-                        sessionStorage.setItem(AUTO_SUBMIT_FLAG_KEY, Date.now().toString());
-                    } catch (e) {}
-                }
-            });
-        }
 
         let hasSubmitted = false;
 
@@ -406,47 +399,22 @@
             const randomDelay = Math.floor(Math.random() * (4500 - 2500 + 1)) + 2500;
 
             setTimeout(() => {
-                // Signal top window: we're about to auto-submit an NYT HIT.
-                // Phase 0 will read the resulting sessionStorage flag and
-                // redirect to /tasks after MTurk navigates the top window.
-                try {
-                    window.top.postMessage({ type: AUTO_SUBMIT_MESSAGE_TYPE }, '*');
-                } catch (e) {}
-                // Same-origin top window can also write the flag directly.
-                try {
-                    if (window.top === window) {
-                        sessionStorage.setItem(AUTO_SUBMIT_FLAG_KEY, Date.now().toString());
-                    }
-                } catch (e) {}
-
                 const submitBtn = document.querySelector(
                     'input[type="submit"], button[type="submit"], .submit-btn, #submitButton, crowd-button[form-action="submit"]'
                 );
 
-                let isClicked = false;
                 if (submitBtn) {
                     submitBtn.click();
-                    isClicked = true;
                 } else {
                     for (const btn of document.querySelectorAll('button, crowd-button')) {
                         if (btn.textContent.toLowerCase().includes('submit')) {
                             btn.click();
-                            isClicked = true;
                             break;
                         }
                     }
                 }
-
-                // 6. After submit -> queue page. Phase 1 picks up 2nd HIT if available.
-                if (isClicked) {
-                    setTimeout(() => {
-                        try {
-                            window.top.location.href = QUEUE_URL;
-                        } catch (e) {
-                            window.location.href = QUEUE_URL;
-                        }
-                    }, 800);
-                }
+                // No redirect here - MTurk navigates the top window
+                // to the post-submit page, and Phase 0 closes it.
             }, randomDelay);
 
             return true;
