@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      3.0
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -20,15 +20,40 @@
     const QUEUE_URL = "https://worker.mturk.com/tasks";
     const currentUrl = window.location.href;
 
+    // Cross-tab close coordination.
+    //
+    // GM_openInTab uses the extension API (chrome.tabs.create) to open
+    // tabs. Chrome treats those tabs as "extension-opened" rather than
+    // "script-opened", so window.close() called from inside the tab is
+    // blocked - and Violentmonkey doesn't expose GM_closeBrowserTab,
+    // so the script inside the tab has no way to ask the engine to
+    // close it.
+    //
+    // What DOES work: the value returned by GM_openInTab has a .close()
+    // method that uses chrome.tabs.remove on the opener side. So the
+    // queue tab keeps a Map of tabId -> handle. When a HIT tab finishes
+    // submitting, it broadcasts its tabId on a BroadcastChannel; the
+    // queue tab catches the broadcast and calls handle.close().
+    //
+    // The tabId is passed to the new tab via a URL fragment, which the
+    // new tab reads on first load and stashes in sessionStorage (so it
+    // survives MTurk's post-submit navigation within the same origin).
+    const CLOSE_CHANNEL_NAME = '__nyt_tab_close__';
+    const TAB_ID_FRAGMENT = '__nyt_tabid__';
+    const TAB_ID_SESSION_KEY = '__nyt_tabid_from_opener__';
+
     // Open a URL in a new background tab. Uses GM_openInTab when
     // available (Tampermonkey/Violentmonkey - bypasses popup blocker
-    // even when not triggered by a user gesture, which matters because
-    // we open from a MutationObserver callback). Falls back to
-    // window.open.
-    const openTabInBackground = (url) => {
+    // even without a user gesture, which matters because we open from
+    // a MutationObserver callback). Falls back to window.open.
+    //
+    // The returned handle is registered with the caller-supplied
+    // onHandle callback so the caller can save it for later closing.
+    const openTabInBackground = (url, onHandle) => {
         try {
             if (typeof GM_openInTab === 'function') {
-                GM_openInTab(url, { active: false, insert: true, setParent: true });
+                const handle = GM_openInTab(url, { active: false, insert: true, setParent: true });
+                if (handle && onHandle) onHandle(handle);
                 return;
             }
         } catch (e) {}
@@ -62,13 +87,26 @@
     //                                    line never runs because the JS
     //                                    context is already destroyed.
     const closeThisTabNow = () => {
+        // 1. Cross-tab: ask the queue tab to close us via the handle it
+        //    saved when it opened this tab. This is the only path that
+        //    works reliably for GM_openInTab tabs in Violentmonkey.
+        try {
+            const myTabId = sessionStorage.getItem(TAB_ID_SESSION_KEY);
+            if (myTabId) {
+                const ch = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+                ch.postMessage({ type: 'close-tab', tabId: myTabId });
+            }
+        } catch (e) {}
+        // 2. GM_closeBrowserTab (Tampermonkey only; undefined in Violentmonkey)
         try {
             if (typeof GM_closeBrowserTab !== 'undefined') {
                 GM_closeBrowserTab();
             }
         } catch (e) {}
+        // 3. Re-claim-self trick (helps on some Chrome versions)
         try { window.opener = null; } catch (e) {}
         try { window.open('', '_self'); } catch (e) {}
+        // 4. Native close paths
         try { window.close(); } catch (e) {}
         try { window.top.close(); } catch (e) {}
         try {
@@ -76,6 +114,9 @@
                 unsafeWindow.close();
             }
         } catch (e) {}
+        // 5. Final fallback: navigate away so this tab stops hitting
+        //    MTurk. If any earlier path actually closed the tab, the JS
+        //    context is destroyed before this line runs.
         try { window.location.replace('about:blank'); } catch (e) {}
     };
 
@@ -258,6 +299,32 @@
         // accepted HIT is no longer in the queue.
         const openedHits = new Set();
 
+        // tabId -> { handle, openedAt }. Populated when we open a HIT
+        // tab; consumed when the HIT tab broadcasts that it wants to
+        // close itself (see CLOSE_CHANNEL_NAME below).
+        const openedTabHandles = new Map();
+
+        // Listen for close requests from HIT tabs we opened.
+        try {
+            const closeChannel = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+            closeChannel.onmessage = (event) => {
+                if (!event.data || event.data.type !== 'close-tab' || !event.data.tabId) return;
+                const entry = openedTabHandles.get(event.data.tabId);
+                if (entry && entry.handle && typeof entry.handle.close === 'function') {
+                    try { entry.handle.close(); } catch (e) {}
+                }
+                openedTabHandles.delete(event.data.tabId);
+            };
+            // Periodically evict stale handles (e.g. tab was closed by
+            // hand, or the HIT never submitted) to keep the Map bounded.
+            setInterval(() => {
+                const cutoff = Date.now() - 10 * 60 * 1000;
+                for (const [id, entry] of openedTabHandles) {
+                    if (entry.openedAt < cutoff) openedTabHandles.delete(id);
+                }
+            }, 60 * 1000);
+        } catch (e) {}
+
         const scanQueueForRequester = () => {
             const rows = document.querySelectorAll(
                 '.project-detail-bar, .table-row, tr, li.task-row, ' +
@@ -284,9 +351,24 @@
                     continue;
                 }
                 if (openedHits.has(absoluteUrl)) continue;
-
                 openedHits.add(absoluteUrl);
-                openTabInBackground(absoluteUrl);
+
+                // Tag the URL with a unique tabId via fragment so the
+                // new tab can identify itself when broadcasting a close
+                // request. Save the handle so we can actually close it.
+                const tabId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+                const urlWithId = absoluteUrl +
+                    (absoluteUrl.includes('#') ? '&' : '#') +
+                    TAB_ID_FRAGMENT + '=' + tabId;
+
+                openTabInBackground(urlWithId, (handle) => {
+                    openedTabHandles.set(tabId, { handle, openedAt: Date.now() });
+                    try {
+                        if ('onclose' in handle) {
+                            handle.onclose = () => openedTabHandles.delete(tabId);
+                        }
+                    } catch (e) {}
+                });
             }
         };
 
@@ -384,6 +466,30 @@
     // happens there.
     // ---------------------------------------------------------
     else if (isHitPage) {
+
+        // Top window only: read the tabId fragment the queue tab tagged
+        // onto our URL when it opened us, stash it in sessionStorage so
+        // it survives MTurk's post-submit navigation, and clean the
+        // fragment off the URL so MTurk's JS doesn't see it.
+        if (!isMturkIframe) {
+            try {
+                const match = window.location.hash.match(
+                    new RegExp(TAB_ID_FRAGMENT + '=([a-z0-9-]+)')
+                );
+                if (match) {
+                    sessionStorage.setItem(TAB_ID_SESSION_KEY, match[1]);
+                    const cleanHash = window.location.hash.replace(
+                        new RegExp('[#&]?' + TAB_ID_FRAGMENT + '=[a-z0-9-]+'),
+                        ''
+                    );
+                    history.replaceState(
+                        null, '',
+                        window.location.pathname + window.location.search +
+                        (cleanHash && cleanHash !== '#' ? cleanHash : '')
+                    );
+                }
+            } catch (e) {}
+        }
 
         let hasSubmitted = false;
 
