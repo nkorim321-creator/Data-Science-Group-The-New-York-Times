@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -36,28 +36,38 @@
     };
 
     // Close the current tab instantly, no warning page, no delay.
-    // Tries multiple methods in order; whichever the userscript
-    // engine + browser allows wins. At least one usually works.
+    // Tries every close path the userscript engine + browser allow.
     //   1. GM_closeBrowserTab          - Tampermonkey/Violentmonkey API,
     //                                    closes any tab regardless of
     //                                    how it was opened (needs the
     //                                    @grant approval in Tampermonkey)
-    //   2. window.open('','_self')     - claims this window as script-
-    //                                    opened in some Chrome versions,
-    //                                    unlocking window.close()
+    //   2. window.opener = null +      - "claim self as script-opened"
+    //      window.open('','_self')       trick; some Chrome versions
+    //                                    let window.close() through
+    //                                    after this
     //   3. window.close()              - native close; works for tabs
     //                                    the browser treats as script-
     //                                    opened (PCM window.open tabs)
     //   4. window.top.close()          - same as 3 but on the top window
     //   5. unsafeWindow.close()        - bypasses Tampermonkey's sandbox
-    //                                    proxy, useful when @grant
-    //                                    sandbox swaps window
+    //                                    proxy
+    //   6. window.location.replace     - final fallback: if nothing
+    //      ('about:blank')               above closed the tab, at least
+    //                                    navigate away from MTurk so the
+    //                                    tab stops making requests and
+    //                                    visibly signals "done" to the
+    //                                    worker (they can close it by
+    //                                    hand). When any earlier method
+    //                                    actually closed the tab, this
+    //                                    line never runs because the JS
+    //                                    context is already destroyed.
     const closeThisTabNow = () => {
         try {
             if (typeof GM_closeBrowserTab !== 'undefined') {
                 GM_closeBrowserTab();
             }
         } catch (e) {}
+        try { window.opener = null; } catch (e) {}
         try { window.open('', '_self'); } catch (e) {}
         try { window.close(); } catch (e) {}
         try { window.top.close(); } catch (e) {}
@@ -66,6 +76,7 @@
                 unsafeWindow.close();
             }
         } catch (e) {}
+        try { window.location.replace('about:blank'); } catch (e) {}
     };
 
     // ---------------------------------------------------------
