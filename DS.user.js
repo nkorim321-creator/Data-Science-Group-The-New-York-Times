@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -321,7 +321,7 @@
         // ---------------------------------------------------------
         const BLANK_CHECK_DELAY_MS = 4000;
         const BLANK_RECHECK_MS = 15000;
-        const MAX_BLANK_RELOADS = 20;
+        const MAX_BLANK_RELOADS = 100;
         const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
 
         const pageLooksLoaded = () => {
@@ -420,8 +420,17 @@
             return true;
         };
 
+        // Cap the polling so that a non-NYT HIT (e.g. one a worker
+        // opened manually via PCM) doesn't keep an interval running
+        // indefinitely. 180 ticks (~3 min) is more than enough time
+        // for any NYT iframe to render and for us to act on it.
+        let pollTicks = 0;
+        const MAX_POLL_TICKS = 180;
         const taskInterval = setInterval(() => {
-            if (processTaskContent()) clearInterval(taskInterval);
+            pollTicks++;
+            if (pollTicks >= MAX_POLL_TICKS || processTaskContent()) {
+                clearInterval(taskInterval);
+            }
         }, 1000);
     }
 })();
