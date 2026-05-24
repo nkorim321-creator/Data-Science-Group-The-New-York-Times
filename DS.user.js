@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close the post-submit tab for manual submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -175,11 +175,29 @@
         // a localStorage slot and refreshes it every 1.5 s; any
         // /tasks tab that loads later and sees a fresh claim from
         // a different tabId closes itself with no warning page.
+        //
+        // The tabId is persisted in sessionStorage so that when the
+        // *same* tab reloads (which it does every 60 s during a BST
+        // window), the new script instance recognises its own
+        // previous heartbeat and does NOT treat itself as a duplicate.
+        // Without this, the 60-s reload loop would silently destroy
+        // itself on every tick.
         // ---------------------------------------------------------
         const PRIMARY_KEY = '__nyt_tasks_primary__';
+        const TAB_ID_KEY = '__nyt_tasks_tab_id__';
         const STALE_MS = 5000;
         const HEARTBEAT_MS = 1500;
-        const myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+
+        let myTabId;
+        try {
+            myTabId = sessionStorage.getItem(TAB_ID_KEY);
+            if (!myTabId) {
+                myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+                sessionStorage.setItem(TAB_ID_KEY, myTabId);
+            }
+        } catch (e) {
+            myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+        }
 
         const readPrimary = () => {
             try {
