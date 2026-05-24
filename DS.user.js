@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close the post-submit tab for manual submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -283,26 +283,34 @@
 
         // ---------------------------------------------------------
         // Blank-page recovery: MTurk sometimes renders /tasks as a
-        // completely blank white page on certain Worker IDs. After
-        // BLANK_CHECK_DELAY_MS we look for any expected queue content;
-        // if missing, reload. Attempts capped to avoid infinite loops.
+        // completely blank white page on certain Worker IDs. Check
+        // 4 s after load, and re-check every 15 s thereafter, in
+        // case the page goes blank later. Reload aggressively
+        // (up to MAX_BLANK_RELOADS times) until the page renders
+        // properly. Counter resets the moment the page looks loaded.
         // ---------------------------------------------------------
-        const BLANK_CHECK_DELAY_MS = 6000;
-        const MAX_BLANK_RELOADS = 5;
+        const BLANK_CHECK_DELAY_MS = 4000;
+        const BLANK_RECHECK_MS = 15000;
+        const MAX_BLANK_RELOADS = 20;
         const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
+
+        const pageLooksLoaded = () => {
+            const text = document.body ? document.body.textContent : '';
+            // A real /tasks page has a substantial amount of text plus
+            // recognizable queue markers. The blank state shows almost
+            // no text at all.
+            if (text.length < 200) return false;
+            return text.includes('HITs Queue') ||
+                   text.includes('Your HITs') ||
+                   text.includes('Requester') ||
+                   text.includes('Browse all available HITs') ||
+                   text.includes('Sign Out');
+        };
 
         const recoverFromBlank = () => {
             if (workClicked) return;
 
-            const text = document.body ? document.body.textContent : '';
-            const looksLoaded =
-                text.includes('HITs Queue') ||
-                text.includes('Your HITs') ||
-                text.includes('Requester') ||
-                text.includes('Browse all available HITs') ||
-                document.querySelector('header, .navbar, .table, table, .task-row, [class*="HitSet"]');
-
-            if (looksLoaded) {
+            if (pageLooksLoaded()) {
                 sessionStorage.removeItem(BLANK_RELOAD_KEY);
                 return;
             }
@@ -321,6 +329,9 @@
         };
 
         setTimeout(recoverFromBlank, BLANK_CHECK_DELAY_MS);
+        // Keep checking every 15 s in case the page renders fine at
+        // first but goes blank later (rare but reported).
+        setInterval(recoverFromBlank, BLANK_RECHECK_MS);
     }
 
     // ---------------------------------------------------------
