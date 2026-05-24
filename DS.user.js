@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks for our auto-submits, instant-close the post-submit tab for manual submits, instant-close any duplicate /tasks tab, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      1.8
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
 // @match        https://*.s3.amazonaws.com/*
-// @grant        GM_closeBrowserTab
+// @grant        none
 // @updateURL    https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // @downloadURL  https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // ==/UserScript==
@@ -18,27 +18,6 @@
     const TARGET_REQUESTER = "Data Science Group, The New York Times";
     const QUEUE_URL = "https://worker.mturk.com/tasks";
     const currentUrl = window.location.href;
-    // Marker our script writes (via postMessage from iframe -> top window) just
-    // before auto-submitting an NYT HIT. Phase 0 only redirects to /tasks when
-    // this marker is fresh, so manual submits of other requesters' HITs do not
-    // get hijacked.
-    const AUTO_SUBMIT_FLAG_KEY = '__nyt_auto_submit_flag__';
-    const AUTO_SUBMIT_FLAG_TTL_MS = 15000;
-    const AUTO_SUBMIT_MESSAGE_TYPE = '__nyt_auto_submit__';
-
-    // Close the current tab instantly, no warning page, no delay.
-    // GM_closeBrowserTab (Tampermonkey/Violentmonkey) can close any
-    // tab; window.close() is a fallback for tabs the userscript
-    // engine considers script-opened.
-    const closeThisTabNow = () => {
-        try {
-            if (typeof GM_closeBrowserTab === 'function') {
-                GM_closeBrowserTab();
-                return;
-            }
-        } catch (e) {}
-        try { window.close(); } catch (e) {}
-    };
 
     // ---------------------------------------------------------
     // Bangladesh Standard Time (BST = UTC+6) reload windows.
@@ -95,32 +74,23 @@
     const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
 
     // ---------------------------------------------------------
-    // PHASE 0: Any non-queue worker.mturk.com page - when a
+    // PHASE 0: Any non-queue worker.mturk.com page - if a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // act on the post-submit tab:
-    //   * AUTO_SUBMIT_FLAG_KEY fresh -> redirect to /tasks
-    //     (keeps the queue tab alive so it can pick up the next HIT)
-    //   * otherwise -> close the tab instantly
-    //     (post-submit landing page for any manual submit)
+    // immediately redirect to /tasks. This catches the case where
+    // MTurk redirects to /projects (HIT Groups) or / after submit
+    // before our in-iframe redirect can fire.
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
         const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
-        let done = false;
+        let redirected = false;
 
         const checkForSubmitBanner = () => {
-            if (done || !document.body) return false;
+            if (redirected || !document.body) return false;
             const text = document.body.textContent || '';
             for (const marker of SUBMIT_MARKERS) {
                 if (text.includes(marker)) {
-                    done = true;
-                    const flagTime = parseInt(sessionStorage.getItem(AUTO_SUBMIT_FLAG_KEY) || '0', 10);
-                    const autoSubmitFresh = flagTime && (Date.now() - flagTime < AUTO_SUBMIT_FLAG_TTL_MS);
-                    if (autoSubmitFresh) {
-                        sessionStorage.removeItem(AUTO_SUBMIT_FLAG_KEY);
-                        window.location.href = QUEUE_URL;
-                    } else {
-                        closeThisTabNow();
-                    }
+                    redirected = true;
+                    window.location.href = QUEUE_URL;
                     return true;
                 }
             }
@@ -137,9 +107,7 @@
                 if (checkForSubmitBanner()) obs.disconnect();
             });
             obs.observe(document.body, { childList: true, subtree: true });
-            // Stop watching after 15 s - if no banner by then, the
-            // worker just navigated here normally (browse, dashboard,
-            // etc.), so leave the page alone.
+            // Stop watching after 15s - if no banner by then, user navigated here manually
             setTimeout(() => obs.disconnect(), 15000);
         };
         startSubmitWatcher();
@@ -149,56 +117,6 @@
     // PHASE 1: Queue page - scan for requester + time-windowed reload
     // ---------------------------------------------------------
     if (isQueuePage) {
-
-        // ---------------------------------------------------------
-        // Single-instance: if another /tasks tab is already open,
-        // close THIS one instantly. The first tab to load claims
-        // a localStorage slot and refreshes it every 1.5 s; any
-        // /tasks tab that loads later and sees a fresh claim from
-        // a different tabId closes itself with no warning page.
-        // ---------------------------------------------------------
-        const PRIMARY_KEY = '__nyt_tasks_primary__';
-        const STALE_MS = 5000;
-        const HEARTBEAT_MS = 1500;
-        const myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
-
-        const readPrimary = () => {
-            try {
-                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
-                if (data && Date.now() - data.heartbeat < STALE_MS) return data;
-            } catch (e) {}
-            return null;
-        };
-        const writePrimary = () => {
-            try {
-                localStorage.setItem(PRIMARY_KEY, JSON.stringify({
-                    tabId: myTabId, heartbeat: Date.now()
-                }));
-            } catch (e) {}
-        };
-
-        const existing = readPrimary();
-        if (existing && existing.tabId !== myTabId) {
-            closeThisTabNow();
-            return;
-        }
-
-        writePrimary();
-        setInterval(() => {
-            const current = readPrimary();
-            if (current && current.tabId !== myTabId) {
-                closeThisTabNow();
-                return;
-            }
-            writePrimary();
-        }, HEARTBEAT_MS);
-
-        window.addEventListener('beforeunload', () => {
-            try {
-                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
-                if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
-            } catch (e) {}
-        });
 
         let workClicked = false;
         const PAGE_LOAD_TIME = Date.now();
@@ -306,33 +224,11 @@
 
     // ---------------------------------------------------------
     // PHASE 2: HIT page - auto-select checkbox, submit, redirect to queue
-    //
-    // The script runs in BOTH the worker.mturk.com top window AND the
-    // cross-origin mturkcontent.com / s3.amazonaws.com iframe. The NYT
-    // HIT content is in the iframe, so the auto-submit happens there.
-    //
-    // Just before auto-submitting, the iframe postMessages the top
-    // window so the top window can write AUTO_SUBMIT_FLAG_KEY into
-    // worker.mturk.com's sessionStorage. That flag is what Phase 0
-    // uses to distinguish our auto-submits from the worker's own
-    // manual submits of other requesters' HITs (which must NOT be
-    // redirected to /tasks, or they'd duplicate the always-open queue).
+    // After submit we try in-iframe redirect (fast path); if MTurk wins
+    // the race and lands on /projects or root, Phase 0 catches the
+    // "HIT Submitted" banner and redirects to /tasks.
     // ---------------------------------------------------------
     else if (isHitPage) {
-
-        // Top window of the HIT page: receive the iframe's signal and
-        // record the flag in worker.mturk.com's sessionStorage so it
-        // survives the navigation MTurk does after the form submits.
-        if (!isMturkIframe) {
-            window.addEventListener('message', (event) => {
-                if (event && event.data && event.data.type === AUTO_SUBMIT_MESSAGE_TYPE) {
-                    try {
-                        sessionStorage.setItem(AUTO_SUBMIT_FLAG_KEY, Date.now().toString());
-                    } catch (e) {}
-                }
-            });
-        }
-
         let hasSubmitted = false;
 
         const processTaskContent = () => {
@@ -358,19 +254,6 @@
             const randomDelay = Math.floor(Math.random() * (4500 - 2500 + 1)) + 2500;
 
             setTimeout(() => {
-                // Signal top window: we're about to auto-submit an NYT HIT.
-                // Phase 0 will read the resulting sessionStorage flag and
-                // redirect to /tasks after MTurk navigates the top window.
-                try {
-                    window.top.postMessage({ type: AUTO_SUBMIT_MESSAGE_TYPE }, '*');
-                } catch (e) {}
-                // Same-origin top window can also write the flag directly.
-                try {
-                    if (window.top === window) {
-                        sessionStorage.setItem(AUTO_SUBMIT_FLAG_KEY, Date.now().toString());
-                    }
-                } catch (e) {}
-
                 const submitBtn = document.querySelector(
                     'input[type="submit"], button[type="submit"], .submit-btn, #submitButton, crowd-button[form-action="submit"]'
                 );
