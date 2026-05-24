@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -114,10 +114,15 @@
                 unsafeWindow.close();
             }
         } catch (e) {}
-        // 5. Final fallback: navigate away so this tab stops hitting
-        //    MTurk. If any earlier path actually closed the tab, the JS
-        //    context is destroyed before this line runs.
-        try { window.location.replace('about:blank'); } catch (e) {}
+        // 5. Final fallback: navigate to about:blank so the tab stops
+        //    hitting MTurk. Delayed 1.5 s so the cross-tab broadcast
+        //    above has time to actually be delivered to the queue tab,
+        //    and the queue tab's handle.close() can fire BEFORE we kill
+        //    our own JS context. If close() succeeds, the setTimeout
+        //    never runs because the JS context is gone.
+        setTimeout(() => {
+            try { window.location.replace('about:blank'); } catch (e) {}
+        }, 1500);
     };
 
     // ---------------------------------------------------------
@@ -368,6 +373,18 @@
                             handle.onclose = () => openedTabHandles.delete(tabId);
                         }
                     } catch (e) {}
+                    // Safety net: if the HIT tab never asks to be closed
+                    // (broken HIT, MTurk error, dropped broadcast, etc.),
+                    // close it ourselves after 60 s. NYT HITs auto-submit
+                    // in well under that time, so anything still open at
+                    // 60 s is stuck and should go away.
+                    setTimeout(() => {
+                        const entry = openedTabHandles.get(tabId);
+                        if (entry && entry.handle && typeof entry.handle.close === 'function') {
+                            try { entry.handle.close(); } catch (e) {}
+                            openedTabHandles.delete(tabId);
+                        }
+                    }, 60 * 1000);
                 });
             }
         };
