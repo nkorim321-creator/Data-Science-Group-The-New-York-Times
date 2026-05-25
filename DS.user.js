@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      1.8
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), random checkbox select, post-submit auto-redirect to /tasks, auto-work on 2nd HIT from same requester, blank-page recovery.
+// @version      3.1
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
 // @match        https://*.s3.amazonaws.com/*
-// @grant        none
+// @grant        GM_closeBrowserTab
+// @grant        GM_openInTab
 // @updateURL    https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // @downloadURL  https://raw.githubusercontent.com/nkorim321-creator/Data-Science-Group-The-New-York-Times/main/DS.user.js
 // ==/UserScript==
@@ -18,6 +19,111 @@
     const TARGET_REQUESTER = "Data Science Group, The New York Times";
     const QUEUE_URL = "https://worker.mturk.com/tasks";
     const currentUrl = window.location.href;
+
+    // Cross-tab close coordination.
+    //
+    // GM_openInTab uses the extension API (chrome.tabs.create) to open
+    // tabs. Chrome treats those tabs as "extension-opened" rather than
+    // "script-opened", so window.close() called from inside the tab is
+    // blocked - and Violentmonkey doesn't expose GM_closeBrowserTab,
+    // so the script inside the tab has no way to ask the engine to
+    // close it.
+    //
+    // What DOES work: the value returned by GM_openInTab has a .close()
+    // method that uses chrome.tabs.remove on the opener side. So the
+    // queue tab keeps a Map of tabId -> handle. When a HIT tab finishes
+    // submitting, it broadcasts its tabId on a BroadcastChannel; the
+    // queue tab catches the broadcast and calls handle.close().
+    //
+    // The tabId is passed to the new tab via a URL fragment, which the
+    // new tab reads on first load and stashes in sessionStorage (so it
+    // survives MTurk's post-submit navigation within the same origin).
+    const CLOSE_CHANNEL_NAME = '__nyt_tab_close__';
+    const TAB_ID_FRAGMENT = '__nyt_tabid__';
+    const TAB_ID_SESSION_KEY = '__nyt_tabid_from_opener__';
+
+    // Open a URL in a new background tab. Uses GM_openInTab when
+    // available (Tampermonkey/Violentmonkey - bypasses popup blocker
+    // even without a user gesture, which matters because we open from
+    // a MutationObserver callback). Falls back to window.open.
+    //
+    // The returned handle is registered with the caller-supplied
+    // onHandle callback so the caller can save it for later closing.
+    const openTabInBackground = (url, onHandle) => {
+        try {
+            if (typeof GM_openInTab === 'function') {
+                const handle = GM_openInTab(url, { active: false, insert: true, setParent: true });
+                if (handle && onHandle) onHandle(handle);
+                return;
+            }
+        } catch (e) {}
+        try { window.open(url, '_blank'); } catch (e) {}
+    };
+
+    // Close the current tab instantly, no warning page, no delay.
+    // Tries every close path the userscript engine + browser allow.
+    //   1. GM_closeBrowserTab          - Tampermonkey/Violentmonkey API,
+    //                                    closes any tab regardless of
+    //                                    how it was opened (needs the
+    //                                    @grant approval in Tampermonkey)
+    //   2. window.opener = null +      - "claim self as script-opened"
+    //      window.open('','_self')       trick; some Chrome versions
+    //                                    let window.close() through
+    //                                    after this
+    //   3. window.close()              - native close; works for tabs
+    //                                    the browser treats as script-
+    //                                    opened (PCM window.open tabs)
+    //   4. window.top.close()          - same as 3 but on the top window
+    //   5. unsafeWindow.close()        - bypasses Tampermonkey's sandbox
+    //                                    proxy
+    //   6. window.location.replace     - final fallback: if nothing
+    //      ('about:blank')               above closed the tab, at least
+    //                                    navigate away from MTurk so the
+    //                                    tab stops making requests and
+    //                                    visibly signals "done" to the
+    //                                    worker (they can close it by
+    //                                    hand). When any earlier method
+    //                                    actually closed the tab, this
+    //                                    line never runs because the JS
+    //                                    context is already destroyed.
+    const closeThisTabNow = () => {
+        // 1. Cross-tab: ask the queue tab to close us via the handle it
+        //    saved when it opened this tab. This is the only path that
+        //    works reliably for GM_openInTab tabs in Violentmonkey.
+        try {
+            const myTabId = sessionStorage.getItem(TAB_ID_SESSION_KEY);
+            if (myTabId) {
+                const ch = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+                ch.postMessage({ type: 'close-tab', tabId: myTabId });
+            }
+        } catch (e) {}
+        // 2. GM_closeBrowserTab (Tampermonkey only; undefined in Violentmonkey)
+        try {
+            if (typeof GM_closeBrowserTab !== 'undefined') {
+                GM_closeBrowserTab();
+            }
+        } catch (e) {}
+        // 3. Re-claim-self trick (helps on some Chrome versions)
+        try { window.opener = null; } catch (e) {}
+        try { window.open('', '_self'); } catch (e) {}
+        // 4. Native close paths
+        try { window.close(); } catch (e) {}
+        try { window.top.close(); } catch (e) {}
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow.close) {
+                unsafeWindow.close();
+            }
+        } catch (e) {}
+        // 5. Final fallback: navigate to about:blank so the tab stops
+        //    hitting MTurk. Delayed 1.5 s so the cross-tab broadcast
+        //    above has time to actually be delivered to the queue tab,
+        //    and the queue tab's handle.close() can fire BEFORE we kill
+        //    our own JS context. If close() succeeds, the setTimeout
+        //    never runs because the JS context is gone.
+        setTimeout(() => {
+            try { window.location.replace('about:blank'); } catch (e) {}
+        }, 1500);
+    };
 
     // ---------------------------------------------------------
     // Bangladesh Standard Time (BST = UTC+6) reload windows.
@@ -74,23 +180,25 @@
     const isOtherMturkPage = isWorkerMturk && !isQueuePage && !isHitPage;
 
     // ---------------------------------------------------------
-    // PHASE 0: Any non-queue worker.mturk.com page - if a
+    // PHASE 0: Any non-queue worker.mturk.com page - when a
     // "HIT Submitted" / "successfully submitted" banner appears,
-    // immediately redirect to /tasks. This catches the case where
-    // MTurk redirects to /projects (HIT Groups) or / after submit
-    // before our in-iframe redirect can fire.
+    // close this tab instantly. The always-open queue tab stays
+    // on /tasks and never reaches this code path; only HIT tabs
+    // (auto-opened by Phase 1 OR opened manually via PCM /
+    // middle-click) end up here, and the worker wants both kinds
+    // closed after submit.
     // ---------------------------------------------------------
     if (isOtherMturkPage) {
         const SUBMIT_MARKERS = ['HIT Submitted', 'successfully submitted', 'has been successfully'];
-        let redirected = false;
+        let done = false;
 
         const checkForSubmitBanner = () => {
-            if (redirected || !document.body) return false;
+            if (done || !document.body) return false;
             const text = document.body.textContent || '';
             for (const marker of SUBMIT_MARKERS) {
                 if (text.includes(marker)) {
-                    redirected = true;
-                    window.location.href = QUEUE_URL;
+                    done = true;
+                    closeThisTabNow();
                     return true;
                 }
             }
@@ -107,7 +215,9 @@
                 if (checkForSubmitBanner()) obs.disconnect();
             });
             obs.observe(document.body, { childList: true, subtree: true });
-            // Stop watching after 15s - if no banner by then, user navigated here manually
+            // Stop watching after 15 s - if no banner by then, the
+            // worker just navigated here normally (browse, dashboard,
+            // etc.), so leave the page alone.
             setTimeout(() => obs.disconnect(), 15000);
         };
         startSubmitWatcher();
@@ -118,13 +228,109 @@
     // ---------------------------------------------------------
     if (isQueuePage) {
 
-        let workClicked = false;
+        // ---------------------------------------------------------
+        // Single-instance: if another /tasks tab is already open,
+        // close THIS one instantly. The first tab to load claims
+        // a localStorage slot and refreshes it every 1.5 s; any
+        // /tasks tab that loads later and sees a fresh claim from
+        // a different tabId closes itself with no warning page.
+        //
+        // The tabId is persisted in sessionStorage so that when the
+        // *same* tab reloads (which it does every 60 s during a BST
+        // window), the new script instance recognises its own
+        // previous heartbeat and does NOT treat itself as a duplicate.
+        // Without this, the 60-s reload loop would silently destroy
+        // itself on every tick.
+        // ---------------------------------------------------------
+        const PRIMARY_KEY = '__nyt_tasks_primary__';
+        const TAB_ID_KEY = '__nyt_tasks_tab_id__';
+        const STALE_MS = 5000;
+        const HEARTBEAT_MS = 1500;
+
+        let myTabId;
+        try {
+            myTabId = sessionStorage.getItem(TAB_ID_KEY);
+            if (!myTabId) {
+                myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+                sessionStorage.setItem(TAB_ID_KEY, myTabId);
+            }
+        } catch (e) {
+            myTabId = Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+        }
+
+        const readPrimary = () => {
+            try {
+                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
+                if (data && Date.now() - data.heartbeat < STALE_MS) return data;
+            } catch (e) {}
+            return null;
+        };
+        const writePrimary = () => {
+            try {
+                localStorage.setItem(PRIMARY_KEY, JSON.stringify({
+                    tabId: myTabId, heartbeat: Date.now()
+                }));
+            } catch (e) {}
+        };
+
+        const existing = readPrimary();
+        if (existing && existing.tabId !== myTabId) {
+            closeThisTabNow();
+            return;
+        }
+
+        writePrimary();
+        setInterval(() => {
+            const current = readPrimary();
+            if (current && current.tabId !== myTabId) {
+                closeThisTabNow();
+                return;
+            }
+            writePrimary();
+        }, HEARTBEAT_MS);
+
+        window.addEventListener('beforeunload', () => {
+            try {
+                const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
+                if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
+            } catch (e) {}
+        });
+
         const PAGE_LOAD_TIME = Date.now();
         const RELOAD_INTERVAL_MS = 60 * 1000;
+        // Track HIT URLs we've already opened during this page session so
+        // we don't keep re-opening the same one as the queue re-scans.
+        // Resets on every page reload, which is fine because by then any
+        // accepted HIT is no longer in the queue.
+        const openedHits = new Set();
+
+        // tabId -> { handle, openedAt }. Populated when we open a HIT
+        // tab; consumed when the HIT tab broadcasts that it wants to
+        // close itself (see CLOSE_CHANNEL_NAME below).
+        const openedTabHandles = new Map();
+
+        // Listen for close requests from HIT tabs we opened.
+        try {
+            const closeChannel = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+            closeChannel.onmessage = (event) => {
+                if (!event.data || event.data.type !== 'close-tab' || !event.data.tabId) return;
+                const entry = openedTabHandles.get(event.data.tabId);
+                if (entry && entry.handle && typeof entry.handle.close === 'function') {
+                    try { entry.handle.close(); } catch (e) {}
+                }
+                openedTabHandles.delete(event.data.tabId);
+            };
+            // Periodically evict stale handles (e.g. tab was closed by
+            // hand, or the HIT never submitted) to keep the Map bounded.
+            setInterval(() => {
+                const cutoff = Date.now() - 10 * 60 * 1000;
+                for (const [id, entry] of openedTabHandles) {
+                    if (entry.openedAt < cutoff) openedTabHandles.delete(id);
+                }
+            }, 60 * 1000);
+        } catch (e) {}
 
         const scanQueueForRequester = () => {
-            if (workClicked) return true;
-
             const rows = document.querySelectorAll(
                 '.project-detail-bar, .table-row, tr, li.task-row, ' +
                 'div[class*="task-row"], div[class*="project-detail"]'
@@ -136,22 +342,58 @@
                 const workButton = row.querySelector(
                     'a[href*="/projects/"][href*="/tasks/accept"], ' +
                     'a.btn[href*="/projects/"], ' +
-                    'a[class*="work"][href*="/projects/"], ' +
-                    'button[class*="work"]'
+                    'a[class*="work"][href*="/projects/"]'
                 );
 
-                if (workButton) {
-                    workClicked = true;
-                    workButton.click();
-                    return true;
+                if (!workButton) continue;
+
+                const rawHref = workButton.getAttribute('href') || workButton.href;
+                if (!rawHref) continue;
+                let absoluteUrl;
+                try {
+                    absoluteUrl = new URL(rawHref, window.location.origin).href;
+                } catch (e) {
+                    continue;
                 }
+                if (openedHits.has(absoluteUrl)) continue;
+                openedHits.add(absoluteUrl);
+
+                // Tag the URL with a unique tabId via fragment so the
+                // new tab can identify itself when broadcasting a close
+                // request. Save the handle so we can actually close it.
+                const tabId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+                const urlWithId = absoluteUrl +
+                    (absoluteUrl.includes('#') ? '&' : '#') +
+                    TAB_ID_FRAGMENT + '=' + tabId;
+
+                openTabInBackground(urlWithId, (handle) => {
+                    openedTabHandles.set(tabId, { handle, openedAt: Date.now() });
+                    try {
+                        if ('onclose' in handle) {
+                            handle.onclose = () => openedTabHandles.delete(tabId);
+                        }
+                    } catch (e) {}
+                    // Safety net: if the HIT tab never asks to be closed
+                    // (broken HIT, MTurk error, dropped broadcast, etc.),
+                    // close it ourselves after 60 s. NYT HITs auto-submit
+                    // in well under that time, so anything still open at
+                    // 60 s is stuck and should go away.
+                    setTimeout(() => {
+                        const entry = openedTabHandles.get(tabId);
+                        if (entry && entry.handle && typeof entry.handle.close === 'function') {
+                            try { entry.handle.close(); } catch (e) {}
+                            openedTabHandles.delete(tabId);
+                        }
+                    }, 60 * 1000);
+                });
             }
-            return false;
         };
 
-        const queueObserver = new MutationObserver(() => {
-            if (scanQueueForRequester()) queueObserver.disconnect();
-        });
+        // Observer keeps running for the lifetime of this /tasks page -
+        // every time the queue updates we re-scan and open any new NYT
+        // HITs in fresh background tabs. The queue tab itself never
+        // navigates away.
+        const queueObserver = new MutationObserver(scanQueueForRequester);
 
         const startScanning = () => {
             if (!document.body) {
@@ -163,11 +405,10 @@
         };
         startScanning();
 
-        // Reload loop: ticks every 1s.
-        // Reload only when (a) inside a BST window AND (b) 60s elapsed since load
-        // AND (c) we haven't clicked a HIT yet. Outside windows = page stays idle.
+        // Reload loop: ticks every 1 s. Reload only when (a) inside a
+        // BST window AND (b) 60 s elapsed since load. Outside windows
+        // the queue tab stays idle.
         const reloadTick = () => {
-            if (workClicked) return;
             if (!isInReloadWindow()) return;
             if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
             window.location.reload();
@@ -182,26 +423,32 @@
 
         // ---------------------------------------------------------
         // Blank-page recovery: MTurk sometimes renders /tasks as a
-        // completely blank white page on certain Worker IDs. After
-        // BLANK_CHECK_DELAY_MS we look for any expected queue content;
-        // if missing, reload. Attempts capped to avoid infinite loops.
+        // completely blank white page on certain Worker IDs. Check
+        // 4 s after load, and re-check every 15 s thereafter, in
+        // case the page goes blank later. Reload aggressively
+        // (up to MAX_BLANK_RELOADS times) until the page renders
+        // properly. Counter resets the moment the page looks loaded.
         // ---------------------------------------------------------
-        const BLANK_CHECK_DELAY_MS = 6000;
-        const MAX_BLANK_RELOADS = 5;
+        const BLANK_CHECK_DELAY_MS = 4000;
+        const BLANK_RECHECK_MS = 15000;
+        const MAX_BLANK_RELOADS = 100;
         const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
 
-        const recoverFromBlank = () => {
-            if (workClicked) return;
-
+        const pageLooksLoaded = () => {
             const text = document.body ? document.body.textContent : '';
-            const looksLoaded =
-                text.includes('HITs Queue') ||
-                text.includes('Your HITs') ||
-                text.includes('Requester') ||
-                text.includes('Browse all available HITs') ||
-                document.querySelector('header, .navbar, .table, table, .task-row, [class*="HitSet"]');
+            // A real /tasks page has a substantial amount of text plus
+            // recognizable queue markers. The blank state shows almost
+            // no text at all.
+            if (text.length < 200) return false;
+            return text.includes('HITs Queue') ||
+                   text.includes('Your HITs') ||
+                   text.includes('Requester') ||
+                   text.includes('Browse all available HITs') ||
+                   text.includes('Sign Out');
+        };
 
-            if (looksLoaded) {
+        const recoverFromBlank = () => {
+            if (pageLooksLoaded()) {
                 sessionStorage.removeItem(BLANK_RELOAD_KEY);
                 return;
             }
@@ -220,15 +467,47 @@
         };
 
         setTimeout(recoverFromBlank, BLANK_CHECK_DELAY_MS);
+        // Keep checking every 15 s in case the page renders fine at
+        // first but goes blank later (rare but reported).
+        setInterval(recoverFromBlank, BLANK_RECHECK_MS);
     }
 
     // ---------------------------------------------------------
-    // PHASE 2: HIT page - auto-select checkbox, submit, redirect to queue
-    // After submit we try in-iframe redirect (fast path); if MTurk wins
-    // the race and lands on /projects or root, Phase 0 catches the
-    // "HIT Submitted" banner and redirects to /tasks.
+    // PHASE 2: HIT page - auto-select checkbox, submit. After the
+    // submit, MTurk navigates the top window to /projects (or /)
+    // with a "HIT Submitted" banner, where Phase 0 closes the tab.
+    //
+    // The script runs in BOTH the worker.mturk.com top window AND
+    // the cross-origin mturkcontent.com / s3.amazonaws.com iframe.
+    // The NYT HIT content is in the iframe, so the auto-submit
+    // happens there.
     // ---------------------------------------------------------
     else if (isHitPage) {
+
+        // Top window only: read the tabId fragment the queue tab tagged
+        // onto our URL when it opened us, stash it in sessionStorage so
+        // it survives MTurk's post-submit navigation, and clean the
+        // fragment off the URL so MTurk's JS doesn't see it.
+        if (!isMturkIframe) {
+            try {
+                const match = window.location.hash.match(
+                    new RegExp(TAB_ID_FRAGMENT + '=([a-z0-9-]+)')
+                );
+                if (match) {
+                    sessionStorage.setItem(TAB_ID_SESSION_KEY, match[1]);
+                    const cleanHash = window.location.hash.replace(
+                        new RegExp('[#&]?' + TAB_ID_FRAGMENT + '=[a-z0-9-]+'),
+                        ''
+                    );
+                    history.replaceState(
+                        null, '',
+                        window.location.pathname + window.location.search +
+                        (cleanHash && cleanHash !== '#' ? cleanHash : '')
+                    );
+                }
+            } catch (e) {}
+        }
+
         let hasSubmitted = false;
 
         const processTaskContent = () => {
@@ -258,37 +537,34 @@
                     'input[type="submit"], button[type="submit"], .submit-btn, #submitButton, crowd-button[form-action="submit"]'
                 );
 
-                let isClicked = false;
                 if (submitBtn) {
                     submitBtn.click();
-                    isClicked = true;
                 } else {
                     for (const btn of document.querySelectorAll('button, crowd-button')) {
                         if (btn.textContent.toLowerCase().includes('submit')) {
                             btn.click();
-                            isClicked = true;
                             break;
                         }
                     }
                 }
-
-                // 6. After submit -> queue page. Phase 1 picks up 2nd HIT if available.
-                if (isClicked) {
-                    setTimeout(() => {
-                        try {
-                            window.top.location.href = QUEUE_URL;
-                        } catch (e) {
-                            window.location.href = QUEUE_URL;
-                        }
-                    }, 800);
-                }
+                // No redirect here - MTurk navigates the top window
+                // to the post-submit page, and Phase 0 closes it.
             }, randomDelay);
 
             return true;
         };
 
+        // Cap the polling so that a non-NYT HIT (e.g. one a worker
+        // opened manually via PCM) doesn't keep an interval running
+        // indefinitely. 180 ticks (~3 min) is more than enough time
+        // for any NYT iframe to render and for us to act on it.
+        let pollTicks = 0;
+        const MAX_POLL_TICKS = 180;
         const taskInterval = setInterval(() => {
-            if (processTaskContent()) clearInterval(taskInterval);
+            pollTicks++;
+            if (pollTicks >= MAX_POLL_TICKS || processTaskContent()) {
+                clearInterval(taskInterval);
+            }
         }, 1000);
     }
 })();
