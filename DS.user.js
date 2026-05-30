@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -290,9 +290,25 @@
         }, HEARTBEAT_MS);
 
         window.addEventListener('beforeunload', () => {
+            // Release our primary slot so a future tab can claim it.
             try {
                 const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
                 if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
+            } catch (e) {}
+            // Close every HIT tab we opened. Without this, when the
+            // queue tab reloads (every 60 s during a BST window) or
+            // the worker closes it by hand, the in-memory handle Map
+            // is destroyed - and any HIT tab still on the about:blank
+            // fallback page no longer has anyone with the authority
+            // to close it. Closing them here keeps the tab list clean.
+            try {
+                for (const entry of openedTabHandles.values()) {
+                    try {
+                        if (entry.handle && typeof entry.handle.close === 'function') {
+                            entry.handle.close();
+                        }
+                    } catch (e) {}
+                }
             } catch (e) {}
         });
 
