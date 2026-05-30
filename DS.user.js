@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, reliably closes the HIT tab after submit via path-keyed cross-tab handle (no about:blank), instant-close any duplicate /tasks tab, blank-page recovery.
+// @version      3.4
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, reliably closes the HIT tab after submit via path-keyed cross-tab handle (no about:blank), closes any duplicate /tasks tab after a 15 s grace period, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
@@ -235,6 +235,8 @@
         const STALE_MS = 5000;
         const HEARTBEAT_MS = 1500;
 
+        const DUPLICATE_WAIT_MS = 15000;
+
         let myTabId;
         try {
             myTabId = sessionStorage.getItem(TAB_ID_KEY);
@@ -261,35 +263,20 @@
             } catch (e) {}
         };
 
-        const existing = readPrimary();
-        if (existing && existing.tabId !== myTabId) {
-            closeThisTabNow();
-            return;
-        }
+        // Shared with both onUnload and runQueueMain via closure.
+        // Lives outside runQueueMain so the unload handler can close
+        // every open HIT tab even though the handles are populated
+        // from inside runQueueMain.
+        let openedTabHandles = [];
 
-        writePrimary();
-        setInterval(() => {
-            const current = readPrimary();
-            if (current && current.tabId !== myTabId) {
-                closeThisTabNow();
-                return;
-            }
-            writePrimary();
-        }, HEARTBEAT_MS);
-
-        window.addEventListener('beforeunload', () => {
-            // Release our primary slot so a future tab can claim it.
+        // Runs on every unload (reload, navigate-away, close). Releases
+        // our primary slot and closes every HIT tab we opened so they
+        // don't outlive their opener and turn into orphans.
+        const onUnload = () => {
             try {
                 const data = JSON.parse(localStorage.getItem(PRIMARY_KEY) || 'null');
                 if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
             } catch (e) {}
-            // Close every HIT tab we opened. Without this, when the
-            // queue tab reloads or the worker closes it by hand, the
-            // in-memory handle list is destroyed and any open HIT tab
-            // is orphaned (no one left holding its handle to close it).
-            // A not-yet-submitted HIT closed here is self-healing: it's
-            // still in the queue, so the reloaded queue tab re-scans and
-            // re-opens it.
             try {
                 for (const entry of openedTabHandles) {
                     try {
@@ -299,194 +286,227 @@
                     } catch (e) {}
                 }
             } catch (e) {}
-        });
-
-        const PAGE_LOAD_TIME = Date.now();
-        const RELOAD_INTERVAL_MS = 60 * 1000;
-        // Track HIT URLs we've already opened during this page session so
-        // we don't keep re-opening the same one as the queue re-scans.
-        // Resets on every page reload, which is fine because by then any
-        // accepted HIT is no longer in the queue.
-        const openedHits = new Set();
-
-        // List of { key, handle, openedAt } for every HIT tab we open.
-        // A list (not a Map) so two HITs from the same project can both
-        // be tracked. Entries are removed when their tab is closed.
-        let openedTabHandles = [];
-
-        const closeHandleEntry = (entry) => {
-            if (!entry) return;
-            if (entry.handle && typeof entry.handle.close === 'function') {
-                try { entry.handle.close(); } catch (e) {}
-            }
-            openedTabHandles = openedTabHandles.filter((e) => e !== entry);
         };
 
-        // Listen for close requests from HIT tabs we opened.
-        try {
-            const closeChannel = new BroadcastChannel(CLOSE_CHANNEL_NAME);
-            const projectOf = (k) => (k ? String(k).split('/')[0] : null);
-            closeChannel.onmessage = (event) => {
-                if (!event.data || event.data.type !== 'close-tab') return;
-                const key = event.data.key;
-                // 1. Exact key match - precise, never closes the wrong tab.
-                let entry = key ? openedTabHandles.find((e) => e.key === key) : null;
-                // 2. Same-project fallback: covers accept_random -> real
-                //    assignmentId, where the projectId is stable but the
-                //    task segment changes. Restricted to the same project
-                //    so an unrelated tab (e.g. a different requester's HIT
-                //    submitted via PCM) can NEVER close one of our tabs.
-                if (!entry && key) {
-                    const proj = projectOf(key);
-                    const matches = openedTabHandles.filter((e) => projectOf(e.key) === proj);
-                    if (matches.length === 1) entry = matches[0];
+        // The scanner, reload tick, blank recovery, etc. live inside
+        // this function so they only ever start running once this tab
+        // has confirmed it's the sole primary - a duplicate that's
+        // about to close shouldn't be opening HIT tabs in parallel.
+        const runQueueMain = () => {
+            const PAGE_LOAD_TIME = Date.now();
+            const RELOAD_INTERVAL_MS = 60 * 1000;
+            // Track HIT URLs we've already opened during this page
+            // session so we don't keep re-opening the same one as the
+            // queue re-scans. Resets on every page reload, which is
+            // fine because by then any accepted HIT is no longer in
+            // the queue.
+            const openedHits = new Set();
+
+            const closeHandleEntry = (entry) => {
+                if (!entry) return;
+                if (entry.handle && typeof entry.handle.close === 'function') {
+                    try { entry.handle.close(); } catch (e) {}
                 }
-                closeHandleEntry(entry);
+                openedTabHandles = openedTabHandles.filter((e) => e !== entry);
             };
-        } catch (e) {}
 
-        // Periodically evict stale handles (HIT never submitted, tab
-        // closed by hand, etc.) so a stuck tab can't keep the queue tab
-        // from reloading forever. 45 s is well past any NYT HIT's
-        // auto-submit time.
-        setInterval(() => {
-            const cutoff = Date.now() - 45 * 1000;
-            for (const entry of openedTabHandles.slice()) {
-                if (entry.openedAt < cutoff) closeHandleEntry(entry);
-            }
-        }, 5 * 1000);
+            // Listen for close requests from HIT tabs we opened.
+            try {
+                const closeChannel = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+                const projectOf = (k) => (k ? String(k).split('/')[0] : null);
+                closeChannel.onmessage = (event) => {
+                    if (!event.data || event.data.type !== 'close-tab') return;
+                    const key = event.data.key;
+                    // 1. Exact key match - precise, never closes the wrong tab.
+                    let entry = key ? openedTabHandles.find((e) => e.key === key) : null;
+                    // 2. Same-project fallback: covers accept_random -> real
+                    //    assignmentId, where the projectId is stable but the
+                    //    task segment changes. Restricted to the same project
+                    //    so an unrelated tab (e.g. a different requester's
+                    //    HIT submitted via PCM) can NEVER close one of ours.
+                    if (!entry && key) {
+                        const proj = projectOf(key);
+                        const matches = openedTabHandles.filter((e) => projectOf(e.key) === proj);
+                        if (matches.length === 1) entry = matches[0];
+                    }
+                    closeHandleEntry(entry);
+                };
+            } catch (e) {}
 
-        const scanQueueForRequester = () => {
-            const rows = document.querySelectorAll(
-                '.project-detail-bar, .table-row, tr, li.task-row, ' +
-                'div[class*="task-row"], div[class*="project-detail"]'
-            );
+            // Periodically evict stale handles (HIT never submitted,
+            // tab closed by hand, etc.) so a stuck tab can't keep the
+            // queue tab from reloading forever. 45 s is well past any
+            // NYT HIT's auto-submit time.
+            setInterval(() => {
+                const cutoff = Date.now() - 45 * 1000;
+                for (const entry of openedTabHandles.slice()) {
+                    if (entry.openedAt < cutoff) closeHandleEntry(entry);
+                }
+            }, 5 * 1000);
 
-            for (const row of rows) {
-                if (!row.textContent || !row.textContent.includes(TARGET_REQUESTER)) continue;
-
-                const workButton = row.querySelector(
-                    'a[href*="/projects/"][href*="/tasks/accept"], ' +
-                    'a.btn[href*="/projects/"], ' +
-                    'a[class*="work"][href*="/projects/"]'
+            const scanQueueForRequester = () => {
+                const rows = document.querySelectorAll(
+                    '.project-detail-bar, .table-row, tr, li.task-row, ' +
+                    'div[class*="task-row"], div[class*="project-detail"]'
                 );
 
-                if (!workButton) continue;
+                for (const row of rows) {
+                    if (!row.textContent || !row.textContent.includes(TARGET_REQUESTER)) continue;
 
-                const rawHref = workButton.getAttribute('href') || workButton.href;
-                if (!rawHref) continue;
-                let absoluteUrl;
-                try {
-                    absoluteUrl = new URL(rawHref, window.location.origin).href;
-                } catch (e) {
-                    continue;
-                }
-                if (openedHits.has(absoluteUrl)) continue;
-                openedHits.add(absoluteUrl);
+                    const workButton = row.querySelector(
+                        'a[href*="/projects/"][href*="/tasks/accept"], ' +
+                        'a.btn[href*="/projects/"], ' +
+                        'a[class*="work"][href*="/projects/"]'
+                    );
 
-                // Key this tab by its HIT path so the tab can match
-                // itself when it broadcasts a close request later.
-                const key = extractHitKey(absoluteUrl);
+                    if (!workButton) continue;
 
-                openTabInBackground(absoluteUrl, (handle) => {
-                    const entry = { key, handle, openedAt: Date.now() };
-                    openedTabHandles.push(entry);
+                    const rawHref = workButton.getAttribute('href') || workButton.href;
+                    if (!rawHref) continue;
+                    let absoluteUrl;
                     try {
-                        if ('onclose' in handle) {
-                            handle.onclose = () => {
-                                openedTabHandles = openedTabHandles.filter((e) => e !== entry);
-                            };
-                        }
-                    } catch (e) {}
-                });
-            }
-        };
+                        absoluteUrl = new URL(rawHref, window.location.origin).href;
+                    } catch (e) {
+                        continue;
+                    }
+                    if (openedHits.has(absoluteUrl)) continue;
+                    openedHits.add(absoluteUrl);
 
-        // Observer keeps running for the lifetime of this /tasks page -
-        // every time the queue updates we re-scan and open any new NYT
-        // HITs in fresh background tabs. The queue tab itself never
-        // navigates away.
-        const queueObserver = new MutationObserver(scanQueueForRequester);
+                    // Key this tab by its HIT path so it can match itself
+                    // when it broadcasts a close request later.
+                    const key = extractHitKey(absoluteUrl);
 
-        const startScanning = () => {
-            if (!document.body) {
-                setTimeout(startScanning, 50);
-                return;
-            }
-            queueObserver.observe(document.body, { childList: true, subtree: true });
-            scanQueueForRequester();
-        };
-        startScanning();
+                    openTabInBackground(absoluteUrl, (handle) => {
+                        const entry = { key, handle, openedAt: Date.now() };
+                        openedTabHandles.push(entry);
+                        try {
+                            if ('onclose' in handle) {
+                                handle.onclose = () => {
+                                    openedTabHandles = openedTabHandles.filter((e) => e !== entry);
+                                };
+                            }
+                        } catch (e) {}
+                    });
+                }
+            };
 
-        // Reload loop: ticks every 1 s. Reload only when (a) inside a
-        // BST window AND (b) 60 s elapsed since load AND (c) we have no
-        // HIT tabs in flight. Reloading would destroy the in-memory
-        // handle list and orphan any open HIT tab, so we hold off until
-        // they've all closed. (The 45 s stale-evictor guarantees this
-        // can't stall the reload indefinitely.)
-        const reloadTick = () => {
-            if (!isInReloadWindow()) return;
-            if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
-            if (openedTabHandles.length > 0) return;
-            window.location.reload();
-        };
-        setInterval(reloadTick, 1000);
+            // Observer keeps running for the lifetime of this /tasks
+            // page - every time the queue updates we re-scan and open
+            // any new NYT HITs in fresh background tabs. The queue tab
+            // itself never navigates away.
+            const queueObserver = new MutationObserver(scanQueueForRequester);
 
-        // Backup: when tab becomes visible after being hidden, re-check immediately
-        // (handles background-tab setTimeout/setInterval throttling).
-        document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) reloadTick();
-        });
+            const startScanning = () => {
+                if (!document.body) {
+                    setTimeout(startScanning, 50);
+                    return;
+                }
+                queueObserver.observe(document.body, { childList: true, subtree: true });
+                scanQueueForRequester();
+            };
+            startScanning();
 
-        // ---------------------------------------------------------
-        // Blank-page recovery: MTurk sometimes renders /tasks as a
-        // completely blank white page on certain Worker IDs. Check
-        // 4 s after load, and re-check every 15 s thereafter, in
-        // case the page goes blank later. Reload aggressively
-        // (up to MAX_BLANK_RELOADS times) until the page renders
-        // properly. Counter resets the moment the page looks loaded.
-        // ---------------------------------------------------------
-        const BLANK_CHECK_DELAY_MS = 4000;
-        const BLANK_RECHECK_MS = 15000;
-        const MAX_BLANK_RELOADS = 100;
-        const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
-
-        const pageLooksLoaded = () => {
-            const text = document.body ? document.body.textContent : '';
-            // A real /tasks page has a substantial amount of text plus
-            // recognizable queue markers. The blank state shows almost
-            // no text at all.
-            if (text.length < 200) return false;
-            return text.includes('HITs Queue') ||
-                   text.includes('Your HITs') ||
-                   text.includes('Requester') ||
-                   text.includes('Browse all available HITs') ||
-                   text.includes('Sign Out');
-        };
-
-        const recoverFromBlank = () => {
-            if (pageLooksLoaded()) {
-                sessionStorage.removeItem(BLANK_RELOAD_KEY);
-                return;
-            }
-
-            const count = parseInt(sessionStorage.getItem(BLANK_RELOAD_KEY) || '0', 10);
-            if (count >= MAX_BLANK_RELOADS) return;
-
-            sessionStorage.setItem(BLANK_RELOAD_KEY, (count + 1).toString());
-
-            if (count < 2) {
+            // Reload loop: ticks every 1 s. Reload only when (a) inside
+            // a BST window AND (b) 60 s elapsed since load AND (c) we
+            // have no HIT tabs in flight. Reloading would destroy the
+            // in-memory handle list and orphan any open HIT tab, so we
+            // hold off until they've all closed. (The 45 s stale-
+            // evictor guarantees this can't stall the reload forever.)
+            const reloadTick = () => {
+                if (!isInReloadWindow()) return;
+                if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
+                if (openedTabHandles.length > 0) return;
                 window.location.reload();
-            } else {
-                // After repeated failures, cache-bust the URL to force a fresh fetch
-                window.location.href = QUEUE_URL + '?_t=' + Date.now();
-            }
+            };
+            setInterval(reloadTick, 1000);
+
+            // Backup: when tab becomes visible after being hidden,
+            // re-check immediately (handles background-tab setTimeout/
+            // setInterval throttling).
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) reloadTick();
+            });
+
+            // ---------------------------------------------------------
+            // Blank-page recovery: MTurk sometimes renders /tasks as a
+            // completely blank white page on certain Worker IDs. Check
+            // 4 s after load, and re-check every 15 s thereafter, in
+            // case the page goes blank later. Reload aggressively
+            // (up to MAX_BLANK_RELOADS times) until the page renders
+            // properly. Counter resets the moment the page loads OK.
+            // ---------------------------------------------------------
+            const BLANK_CHECK_DELAY_MS = 4000;
+            const BLANK_RECHECK_MS = 15000;
+            const MAX_BLANK_RELOADS = 100;
+            const BLANK_RELOAD_KEY = '__nyt_userscript_blank_count__';
+
+            const pageLooksLoaded = () => {
+                const text = document.body ? document.body.textContent : '';
+                if (text.length < 200) return false;
+                return text.includes('HITs Queue') ||
+                       text.includes('Your HITs') ||
+                       text.includes('Requester') ||
+                       text.includes('Browse all available HITs') ||
+                       text.includes('Sign Out');
+            };
+
+            const recoverFromBlank = () => {
+                if (pageLooksLoaded()) {
+                    sessionStorage.removeItem(BLANK_RELOAD_KEY);
+                    return;
+                }
+                const count = parseInt(sessionStorage.getItem(BLANK_RELOAD_KEY) || '0', 10);
+                if (count >= MAX_BLANK_RELOADS) return;
+                sessionStorage.setItem(BLANK_RELOAD_KEY, (count + 1).toString());
+                if (count < 2) {
+                    window.location.reload();
+                } else {
+                    window.location.href = QUEUE_URL + '?_t=' + Date.now();
+                }
+            };
+
+            setTimeout(recoverFromBlank, BLANK_CHECK_DELAY_MS);
+            // Keep checking every 15 s in case the page renders fine
+            // at first but goes blank later (rare but reported).
+            setInterval(recoverFromBlank, BLANK_RECHECK_MS);
         };
 
-        setTimeout(recoverFromBlank, BLANK_CHECK_DELAY_MS);
-        // Keep checking every 15 s in case the page renders fine at
-        // first but goes blank later (rare but reported).
-        setInterval(recoverFromBlank, BLANK_RECHECK_MS);
+        // Become the primary /tasks tab: claim the slot, start the
+        // heartbeat, register the unload cleanup, and run the rest of
+        // Phase 1 (scanner / reload tick / blank recovery).
+        const becomePrimary = () => {
+            writePrimary();
+            setInterval(() => {
+                const current = readPrimary();
+                if (current && current.tabId !== myTabId) {
+                    closeThisTabNow();
+                    return;
+                }
+                writePrimary();
+            }, HEARTBEAT_MS);
+
+            window.addEventListener('beforeunload', onUnload);
+            runQueueMain();
+        };
+
+        const existing = readPrimary();
+        if (existing && existing.tabId !== myTabId) {
+            // Another /tasks tab is already primary. Wait 15 s before
+            // closing this one - the wait gives transient overlaps
+            // (e.g. the primary reloading mid-tick) time to settle.
+            // If the primary's heartbeat goes stale during the wait,
+            // this tab promotes itself instead of closing.
+            setTimeout(() => {
+                const stillExisting = readPrimary();
+                if (stillExisting && stillExisting.tabId !== myTabId) {
+                    closeThisTabNow();
+                } else {
+                    becomePrimary();
+                }
+            }, DUPLICATE_WAIT_MS);
+        } else {
+            becomePrimary();
+        }
     }
 
     // ---------------------------------------------------------
