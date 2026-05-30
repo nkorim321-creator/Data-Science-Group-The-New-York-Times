@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.2
-// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, instant-close the post-submit tab, instant-close any duplicate /tasks tab, blank-page recovery.
+// @version      3.3
+// @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, reliably closes the HIT tab after submit via path-keyed cross-tab handle (no about:blank), instant-close any duplicate /tasks tab, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturkcontent.com/*
@@ -26,21 +26,37 @@
     // tabs. Chrome treats those tabs as "extension-opened" rather than
     // "script-opened", so window.close() called from inside the tab is
     // blocked - and Violentmonkey doesn't expose GM_closeBrowserTab,
-    // so the script inside the tab has no way to ask the engine to
-    // close it.
+    // so the script inside the HIT tab has NO way to close itself.
     //
-    // What DOES work: the value returned by GM_openInTab has a .close()
-    // method that uses chrome.tabs.remove on the opener side. So the
-    // queue tab keeps a Map of tabId -> handle. When a HIT tab finishes
-    // submitting, it broadcasts its tabId on a BroadcastChannel; the
-    // queue tab catches the broadcast and calls handle.close().
+    // What DOES work: the value GM_openInTab returns has a .close()
+    // method that runs chrome.tabs.remove on the OPENER (queue tab)
+    // side. So the queue tab keeps a list of { key, handle } for every
+    // HIT tab it opens. When a HIT tab finishes submitting, it
+    // broadcasts its key on a BroadcastChannel; the queue tab matches
+    // the key to a handle and calls handle.close().
     //
-    // The tabId is passed to the new tab via a URL fragment, which the
-    // new tab reads on first load and stashes in sessionStorage (so it
-    // survives MTurk's post-submit navigation within the same origin).
+    // The key is the HIT's own /projects/<projectId>/tasks/<taskId>
+    // path, read from window.location (NOT a URL fragment - MTurk's
+    // SPA router strips hashes before our script can read them, which
+    // is why the old fragment approach failed and left about:blank
+    // tabs behind). The path is the route itself, so it always
+    // survives, and it's stored in sessionStorage so it persists
+    // across MTurk's post-submit navigation within the same tab.
     const CLOSE_CHANNEL_NAME = '__nyt_tab_close__';
-    const TAB_ID_FRAGMENT = '__nyt_tabid__';
-    const TAB_ID_SESSION_KEY = '__nyt_tabid_from_opener__';
+    const HIT_KEY_SESSION_KEY = '__nyt_hit_key__';
+
+    // Extract a stable per-HIT key from a URL or path:
+    // "/projects/<projectId>/tasks/<taskId>" -> "<projectId>/<taskId>".
+    // Returns null if the URL isn't a HIT task URL.
+    const extractHitKey = (urlOrPath) => {
+        try {
+            let path = urlOrPath;
+            if (/^https?:/i.test(urlOrPath)) path = new URL(urlOrPath).pathname;
+            const m = path.match(/\/projects\/([^/]+)\/tasks\/([^/?#]+)/);
+            if (m) return m[1] + '/' + m[2];
+        } catch (e) {}
+        return null;
+    };
 
     // Open a URL in a new background tab. Uses GM_openInTab when
     // available (Tampermonkey/Violentmonkey - bypasses popup blocker
@@ -60,53 +76,34 @@
         try { window.open(url, '_blank'); } catch (e) {}
     };
 
-    // Close the current tab instantly, no warning page, no delay.
-    // Tries every close path the userscript engine + browser allow.
-    //   1. GM_closeBrowserTab          - Tampermonkey/Violentmonkey API,
-    //                                    closes any tab regardless of
-    //                                    how it was opened (needs the
-    //                                    @grant approval in Tampermonkey)
-    //   2. window.opener = null +      - "claim self as script-opened"
-    //      window.open('','_self')       trick; some Chrome versions
-    //                                    let window.close() through
-    //                                    after this
-    //   3. window.close()              - native close; works for tabs
-    //                                    the browser treats as script-
-    //                                    opened (PCM window.open tabs)
-    //   4. window.top.close()          - same as 3 but on the top window
-    //   5. unsafeWindow.close()        - bypasses Tampermonkey's sandbox
-    //                                    proxy
-    //   6. window.location.replace     - final fallback: if nothing
-    //      ('about:blank')               above closed the tab, at least
-    //                                    navigate away from MTurk so the
-    //                                    tab stops making requests and
-    //                                    visibly signals "done" to the
-    //                                    worker (they can close it by
-    //                                    hand). When any earlier method
-    //                                    actually closed the tab, this
-    //                                    line never runs because the JS
-    //                                    context is already destroyed.
+    // Close the current tab. Two independent mechanisms run; whichever
+    // applies to this tab's origin wins. NO about:blank fallback - a
+    // visible blank tab is worse than a tab that closes a moment later
+    // via its opener, and with the path-based key the broadcast is now
+    // reliable.
+    //   A. Cross-tab broadcast - for tabs WE opened with GM_openInTab.
+    //      The HIT tab can't close itself (extension-opened), so it
+    //      asks the queue tab (which holds the handle) to close it.
+    //   B. Local close paths    - for tabs opened by window.open (e.g.
+    //      a HIT the worker grabbed via PCM). Those ARE script-opened,
+    //      so window.close() / GM_closeBrowserTab work directly.
     const closeThisTabNow = () => {
-        // 1. Cross-tab: ask the queue tab to close us via the handle it
-        //    saved when it opened this tab. This is the only path that
-        //    works reliably for GM_openInTab tabs in Violentmonkey.
+        // A. Broadcast our path key so the queue tab can close us.
         try {
-            const myTabId = sessionStorage.getItem(TAB_ID_SESSION_KEY);
-            if (myTabId) {
-                const ch = new BroadcastChannel(CLOSE_CHANNEL_NAME);
-                ch.postMessage({ type: 'close-tab', tabId: myTabId });
-            }
+            const myKey = sessionStorage.getItem(HIT_KEY_SESSION_KEY) ||
+                          extractHitKey(window.location.href);
+            const ch = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+            ch.postMessage({ type: 'close-tab', key: myKey || null });
         } catch (e) {}
-        // 2. GM_closeBrowserTab (Tampermonkey only; undefined in Violentmonkey)
+        // B. Local close paths (work for window.open / PCM tabs and for
+        //    Tampermonkey via GM_closeBrowserTab).
         try {
             if (typeof GM_closeBrowserTab !== 'undefined') {
                 GM_closeBrowserTab();
             }
         } catch (e) {}
-        // 3. Re-claim-self trick (helps on some Chrome versions)
         try { window.opener = null; } catch (e) {}
         try { window.open('', '_self'); } catch (e) {}
-        // 4. Native close paths
         try { window.close(); } catch (e) {}
         try { window.top.close(); } catch (e) {}
         try {
@@ -114,15 +111,6 @@
                 unsafeWindow.close();
             }
         } catch (e) {}
-        // 5. Final fallback: navigate to about:blank so the tab stops
-        //    hitting MTurk. Delayed 1.5 s so the cross-tab broadcast
-        //    above has time to actually be delivered to the queue tab,
-        //    and the queue tab's handle.close() can fire BEFORE we kill
-        //    our own JS context. If close() succeeds, the setTimeout
-        //    never runs because the JS context is gone.
-        setTimeout(() => {
-            try { window.location.replace('about:blank'); } catch (e) {}
-        }, 1500);
     };
 
     // ---------------------------------------------------------
@@ -296,13 +284,14 @@
                 if (data && data.tabId === myTabId) localStorage.removeItem(PRIMARY_KEY);
             } catch (e) {}
             // Close every HIT tab we opened. Without this, when the
-            // queue tab reloads (every 60 s during a BST window) or
-            // the worker closes it by hand, the in-memory handle Map
-            // is destroyed - and any HIT tab still on the about:blank
-            // fallback page no longer has anyone with the authority
-            // to close it. Closing them here keeps the tab list clean.
+            // queue tab reloads or the worker closes it by hand, the
+            // in-memory handle list is destroyed and any open HIT tab
+            // is orphaned (no one left holding its handle to close it).
+            // A not-yet-submitted HIT closed here is self-healing: it's
+            // still in the queue, so the reloaded queue tab re-scans and
+            // re-opens it.
             try {
-                for (const entry of openedTabHandles.values()) {
+                for (const entry of openedTabHandles) {
                     try {
                         if (entry.handle && typeof entry.handle.close === 'function') {
                             entry.handle.close();
@@ -320,31 +309,52 @@
         // accepted HIT is no longer in the queue.
         const openedHits = new Set();
 
-        // tabId -> { handle, openedAt }. Populated when we open a HIT
-        // tab; consumed when the HIT tab broadcasts that it wants to
-        // close itself (see CLOSE_CHANNEL_NAME below).
-        const openedTabHandles = new Map();
+        // List of { key, handle, openedAt } for every HIT tab we open.
+        // A list (not a Map) so two HITs from the same project can both
+        // be tracked. Entries are removed when their tab is closed.
+        let openedTabHandles = [];
+
+        const closeHandleEntry = (entry) => {
+            if (!entry) return;
+            if (entry.handle && typeof entry.handle.close === 'function') {
+                try { entry.handle.close(); } catch (e) {}
+            }
+            openedTabHandles = openedTabHandles.filter((e) => e !== entry);
+        };
 
         // Listen for close requests from HIT tabs we opened.
         try {
             const closeChannel = new BroadcastChannel(CLOSE_CHANNEL_NAME);
+            const projectOf = (k) => (k ? String(k).split('/')[0] : null);
             closeChannel.onmessage = (event) => {
-                if (!event.data || event.data.type !== 'close-tab' || !event.data.tabId) return;
-                const entry = openedTabHandles.get(event.data.tabId);
-                if (entry && entry.handle && typeof entry.handle.close === 'function') {
-                    try { entry.handle.close(); } catch (e) {}
+                if (!event.data || event.data.type !== 'close-tab') return;
+                const key = event.data.key;
+                // 1. Exact key match - precise, never closes the wrong tab.
+                let entry = key ? openedTabHandles.find((e) => e.key === key) : null;
+                // 2. Same-project fallback: covers accept_random -> real
+                //    assignmentId, where the projectId is stable but the
+                //    task segment changes. Restricted to the same project
+                //    so an unrelated tab (e.g. a different requester's HIT
+                //    submitted via PCM) can NEVER close one of our tabs.
+                if (!entry && key) {
+                    const proj = projectOf(key);
+                    const matches = openedTabHandles.filter((e) => projectOf(e.key) === proj);
+                    if (matches.length === 1) entry = matches[0];
                 }
-                openedTabHandles.delete(event.data.tabId);
+                closeHandleEntry(entry);
             };
-            // Periodically evict stale handles (e.g. tab was closed by
-            // hand, or the HIT never submitted) to keep the Map bounded.
-            setInterval(() => {
-                const cutoff = Date.now() - 10 * 60 * 1000;
-                for (const [id, entry] of openedTabHandles) {
-                    if (entry.openedAt < cutoff) openedTabHandles.delete(id);
-                }
-            }, 60 * 1000);
         } catch (e) {}
+
+        // Periodically evict stale handles (HIT never submitted, tab
+        // closed by hand, etc.) so a stuck tab can't keep the queue tab
+        // from reloading forever. 45 s is well past any NYT HIT's
+        // auto-submit time.
+        setInterval(() => {
+            const cutoff = Date.now() - 45 * 1000;
+            for (const entry of openedTabHandles.slice()) {
+                if (entry.openedAt < cutoff) closeHandleEntry(entry);
+            }
+        }, 5 * 1000);
 
         const scanQueueForRequester = () => {
             const rows = document.querySelectorAll(
@@ -374,33 +384,20 @@
                 if (openedHits.has(absoluteUrl)) continue;
                 openedHits.add(absoluteUrl);
 
-                // Tag the URL with a unique tabId via fragment so the
-                // new tab can identify itself when broadcasting a close
-                // request. Save the handle so we can actually close it.
-                const tabId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
-                const urlWithId = absoluteUrl +
-                    (absoluteUrl.includes('#') ? '&' : '#') +
-                    TAB_ID_FRAGMENT + '=' + tabId;
+                // Key this tab by its HIT path so the tab can match
+                // itself when it broadcasts a close request later.
+                const key = extractHitKey(absoluteUrl);
 
-                openTabInBackground(urlWithId, (handle) => {
-                    openedTabHandles.set(tabId, { handle, openedAt: Date.now() });
+                openTabInBackground(absoluteUrl, (handle) => {
+                    const entry = { key, handle, openedAt: Date.now() };
+                    openedTabHandles.push(entry);
                     try {
                         if ('onclose' in handle) {
-                            handle.onclose = () => openedTabHandles.delete(tabId);
+                            handle.onclose = () => {
+                                openedTabHandles = openedTabHandles.filter((e) => e !== entry);
+                            };
                         }
                     } catch (e) {}
-                    // Safety net: if the HIT tab never asks to be closed
-                    // (broken HIT, MTurk error, dropped broadcast, etc.),
-                    // close it ourselves after 60 s. NYT HITs auto-submit
-                    // in well under that time, so anything still open at
-                    // 60 s is stuck and should go away.
-                    setTimeout(() => {
-                        const entry = openedTabHandles.get(tabId);
-                        if (entry && entry.handle && typeof entry.handle.close === 'function') {
-                            try { entry.handle.close(); } catch (e) {}
-                            openedTabHandles.delete(tabId);
-                        }
-                    }, 60 * 1000);
                 });
             }
         };
@@ -422,11 +419,15 @@
         startScanning();
 
         // Reload loop: ticks every 1 s. Reload only when (a) inside a
-        // BST window AND (b) 60 s elapsed since load. Outside windows
-        // the queue tab stays idle.
+        // BST window AND (b) 60 s elapsed since load AND (c) we have no
+        // HIT tabs in flight. Reloading would destroy the in-memory
+        // handle list and orphan any open HIT tab, so we hold off until
+        // they've all closed. (The 45 s stale-evictor guarantees this
+        // can't stall the reload indefinitely.)
         const reloadTick = () => {
             if (!isInReloadWindow()) return;
             if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
+            if (openedTabHandles.length > 0) return;
             window.location.reload();
         };
         setInterval(reloadTick, 1000);
@@ -500,27 +501,16 @@
     // ---------------------------------------------------------
     else if (isHitPage) {
 
-        // Top window only: read the tabId fragment the queue tab tagged
-        // onto our URL when it opened us, stash it in sessionStorage so
-        // it survives MTurk's post-submit navigation, and clean the
-        // fragment off the URL so MTurk's JS doesn't see it.
+        // Top window only: record this HIT's path key in sessionStorage
+        // the moment the task page loads. The key is read straight from
+        // the URL path (the route MTurk itself uses), so unlike the old
+        // URL-fragment trick it can't be stripped by MTurk's SPA router.
+        // It persists in sessionStorage across the post-submit
+        // navigation so Phase 0 can broadcast it to the queue tab.
         if (!isMturkIframe) {
             try {
-                const match = window.location.hash.match(
-                    new RegExp(TAB_ID_FRAGMENT + '=([a-z0-9-]+)')
-                );
-                if (match) {
-                    sessionStorage.setItem(TAB_ID_SESSION_KEY, match[1]);
-                    const cleanHash = window.location.hash.replace(
-                        new RegExp('[#&]?' + TAB_ID_FRAGMENT + '=[a-z0-9-]+'),
-                        ''
-                    );
-                    history.replaceState(
-                        null, '',
-                        window.location.pathname + window.location.search +
-                        (cleanHash && cleanHash !== '#' ? cleanHash : '')
-                    );
-                }
+                const key = extractHitKey(window.location.href);
+                if (key) sessionStorage.setItem(HIT_KEY_SESSION_KEY, key);
             } catch (e) {}
         }
 
