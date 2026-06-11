@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      3.5
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, reliably closes the HIT tab after submit via path-keyed cross-tab handle (no about:blank), closes any duplicate /tasks tab after a 15 s grace period, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -458,10 +458,19 @@
                 const count = parseInt(sessionStorage.getItem(BLANK_RELOAD_KEY) || '0', 10);
                 if (count >= MAX_BLANK_RELOADS) return;
                 sessionStorage.setItem(BLANK_RELOAD_KEY, (count + 1).toString());
-                if (count < 2) {
-                    window.location.reload();
+                // Always recover with a plain reload of the clean /tasks
+                // URL - exactly what a mouse reload does. NEVER navigate
+                // to a ?_t=<timestamp> cache-busted URL: MTurk responds
+                // to those with the same white page, which turned the
+                // recovery itself into a white-page loop.
+                if (window.location.search) {
+                    // A previous script version (or anything else) left a
+                    // query string like ?_t=... on this tab. Reloading it
+                    // in place would re-request the same poisoned URL, so
+                    // strip it by going back to the bare queue URL once.
+                    window.location.replace(QUEUE_URL);
                 } else {
-                    window.location.href = QUEUE_URL + '?_t=' + Date.now();
+                    window.location.reload();
                 }
             };
 
