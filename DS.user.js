@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MTurk Automation - NYT (BST Time-Window Reload & Fast Return)
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.6
 // @description  Automates NYT HITs on MTurk: BST time-windowed queue reload (every 1 min during specific windows), opens detected NYT HITs in NEW background tabs (queue tab stays put), random checkbox select + submit in the new tab, reliably closes the HIT tab after submit via path-keyed cross-tab handle (no about:blank), closes any duplicate /tasks tab after a 15 s grace period, blank-page recovery.
 // @author       You
 // @match        https://worker.mturk.com/*
@@ -123,6 +123,15 @@
     //   11:00 - 11:30 AM
     //   09:00 - 09:30 PM  (21:00 - 21:30)
     // ---------------------------------------------------------
+    // ---------------------------------------------------------
+    // Master switch for the BST time-window auto-reload below.
+    // Currently OFF per the worker's request - the queue tab does
+    // NOT auto-reload at all. Set to true to re-enable the 60 s
+    // reload during the listed windows. (The blank/white-page
+    // recovery reload is separate and stays active regardless.)
+    // ---------------------------------------------------------
+    const AUTO_RELOAD_ENABLED = false;
+
     const RELOAD_WINDOWS = [
         [ 2 * 60,  2 * 60 + 30],
         [16 * 60, 16 * 60 + 30],
@@ -406,13 +415,15 @@
             };
             startScanning();
 
-            // Reload loop: ticks every 1 s. Reload only when (a) inside
-            // a BST window AND (b) 60 s elapsed since load AND (c) we
-            // have no HIT tabs in flight. Reloading would destroy the
-            // in-memory handle list and orphan any open HIT tab, so we
-            // hold off until they've all closed. (The 45 s stale-
-            // evictor guarantees this can't stall the reload forever.)
+            // Reload loop: ticks every 1 s. Reload only when (a) the
+            // master switch is ON AND (b) inside a BST window AND
+            // (c) 60 s elapsed since load AND (d) we have no HIT tabs
+            // in flight. Reloading would destroy the in-memory handle
+            // list and orphan any open HIT tab, so we hold off until
+            // they've all closed. (The 45 s stale-evictor guarantees
+            // this can't stall the reload forever.)
             const reloadTick = () => {
+                if (!AUTO_RELOAD_ENABLED) return;
                 if (!isInReloadWindow()) return;
                 if (Date.now() - PAGE_LOAD_TIME < RELOAD_INTERVAL_MS) return;
                 if (openedTabHandles.length > 0) return;
